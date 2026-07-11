@@ -1,0 +1,10 @@
+build/
+install/
+log/
+bags/
+output/
+*.mcap
+*.db3
+*.bag
+*.ply
+*.pcd
