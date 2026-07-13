@@ -1,0 +1,125 @@
+# ============================================================
+# ROS 2 / colcon generated directories
+# ============================================================
+/build/
+/install/
+/log/
+
+**/build/
+**/install/
+**/log/
+
+.colcon/
+.colcon_install_layout
+
+# ============================================================
+# CMake generated files
+# ============================================================
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/CTestTestfile.cmake
+**/Testing/
+**/_deps/
+compile_commands.json
+
+# ============================================================
+# Python generated files
+# ============================================================
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ============================================================
+# Runtime / temporary files
+# ============================================================
+*.log
+*.pid
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
+core
+core.*
+imgui.ini
+
+# ============================================================
+# ROS bag recordings
+# ============================================================
+*.bag
+*.bag.active
+*.db3
+*.mcap
+rosbag2_*/
+**/rosbag2_/
+
+# ============================================================
+# LiDAR / point cloud / generated maps
+# ============================================================
+*.pcd
+*.ply
+*.las
+*.laz
+*.pcap
+*.pcapng
+*.bt
+*.ot
+*.octomap
+
+# ============================================================
+# Large generated arrays and datasets
+# ============================================================
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+/data/
+/dataset/
+/datasets/
+/recordings/
+/bags/
+/outputs/
+/output/
+
+# ============================================================
+# AI model weights
+# ============================================================
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.plan
+
+# ============================================================
+# Archives
+# ============================================================
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+
+# ============================================================
+# IDE / editor
+# ============================================================
+.vscode/
+.idea/
+.clangd/
+.cache/
+.DS_Store
+Thumbs.db
+
+# Workspace diagnostic / temporary listing files
+/src/build_*
+/src/latest_build
+/src/list_*
