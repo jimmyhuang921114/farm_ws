@@ -1,0 +1,16 @@
+ahrs_bringup:
+  ros__parameters:
+    if_debug_: false
+    device_type_: 1
+    serial_port_: /dev/ttyUSB0
+    serial_baud_: 921600
+    serial_open_retries: 5
+    serial_retry_delay_ms: 1000
+    imu_topic: /imu
+    imu_frame_id_: imu_link
+    mag_pose_2d_topic: /mag_pose_2d
+    Magnetic_topic: /magnetic
+    Euler_angles_topic: /euler_angles
+    gps_topic: /gps/fix
+    twist_topic: /system_speed
+    NED_odom_topic: /NED_odometry

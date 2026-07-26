@@ -1,0 +1,67 @@
+<?xml version="1.0"?>
+
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- ========================================================= -->
+  <!-- Frame names                                               -->
+  <!-- ========================================================= -->
+
+  <xacro:property name="base_frame"
+                  value="base_link"/>
+
+  <xacro:property name="lidar_frame"
+                  value="livox_frame"/>
+
+  <xacro:property name="imu_frame"
+                  value="livox_imu"/>
+
+  <xacro:property name="camera_frame"
+                  value="camera_link"/>
+
+  <xacro:property name="camera_optical_frame"
+                  value="camera_color_optical_frame"/>
+
+
+  <!-- ========================================================= -->
+  <!-- base_link -> MID-360                                      -->
+  <!--                                                           -->
+  <!-- 修改這裡：MID-360 相對感測器平台原點的位置                 -->
+  <!-- xyz 單位：公尺                                             -->
+  <!-- rpy 單位：弧度                                             -->
+  <!-- ========================================================= -->
+
+  <xacro:property name="base_to_lidar_xyz"
+                  value="0.0 0.0 0.0"/>
+
+  <xacro:property name="base_to_lidar_rpy"
+                  value="0.0 0.0 0.0"/>
+
+
+  <!-- ========================================================= -->
+  <!-- MID-360 LiDAR -> MID-360 internal IMU                     -->
+  <!--                                                           -->
+  <!-- MID-360 初始參考值                                        -->
+  <!-- 請配合 GLIM 的 T_lidar_imu 驗證                            -->
+  <!-- ========================================================= -->
+
+  <xacro:property name="lidar_to_imu_xyz"
+                  value="0.011 0.02329 -0.04412"/>
+
+  <xacro:property name="lidar_to_imu_rpy"
+                  value="0.0 0.0 0.0"/>
+
+
+  <!-- ========================================================= -->
+  <!-- base_link -> Camera                                       -->
+  <!--                                                           -->
+  <!-- 修改這裡：相機相對感測器平台原點的位置                    -->
+  <!-- 目前全部設為 0，只是格式範本                               -->
+  <!-- ========================================================= -->
+
+  <xacro:property name="base_to_camera_xyz"
+                  value="0.0 0.0 0.0"/>
+
+  <xacro:property name="base_to_camera_rpy"
+                  value="0.0 0.0 0.0"/>
+
+</robot>

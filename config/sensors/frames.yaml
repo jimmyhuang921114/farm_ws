@@ -1,0 +1,24 @@
+# Initial mounting assumptions. These are not calibrated final extrinsics.
+base_to_velodyne:
+  parent: base_link
+  child: velodyne
+  translation: [0.0, 0.0, 0.0]
+  rpy: [0.0, 0.0, 0.0]
+  calibrated: false
+
+velodyne_to_imu:
+  parent: velodyne
+  child: imu_link
+  translation: [0.0, 0.0, 0.07]
+  rpy: [3.141592653589793, 0.0, 1.5707963267948966]
+  calibrated: false
+
+velodyne_to_camera:
+  parent: velodyne
+  child: camera_link
+  status: REQUIRES_CALIBRATION
+  calibrated: false
+  translation: REQUIRES_CALIBRATION
+  rpy: REQUIRES_CALIBRATION
+
+# camera_link -> camera_color_optical_frame is published by realsense2_camera.

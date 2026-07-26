@@ -1,0 +1,32 @@
+[
+  {
+    "timestamp": "2026-07-13T04:27:48.749284+08:00",
+    "level": "INFO",
+    "message": "Preflight completed",
+    "marker": ""
+  },
+  {
+    "timestamp": "2026-07-13T04:27:49.217016+08:00",
+    "level": "INFO",
+    "message": "Countdown started",
+    "marker": ""
+  },
+  {
+    "timestamp": "2026-07-13T04:27:52.276558+08:00",
+    "level": "INFO",
+    "message": "Recording timer started",
+    "marker": ""
+  },
+  {
+    "timestamp": "2026-07-13T04:28:02.276611+08:00",
+    "level": "INFO",
+    "message": "Duration completed",
+    "marker": ""
+  },
+  {
+    "timestamp": "2026-07-13T04:28:02.285223+08:00",
+    "level": "INFO",
+    "message": "Session completed",
+    "marker": ""
+  }
+]

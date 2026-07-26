@@ -1,6 +1,0 @@
-[submodule "src/glim"]
-	path = src/glim
-	url = https://github.com/koide3/glim.git
-[submodule "src/glim_ros2"]
-	path = src/glim_ros2
-	url = https://github.com/koide3/glim_ros2.git

@@ -8,3 +8,174 @@ output/
 *.bag
 *.ply
 *.pcd
+
+# ROS 2 / colcon generated files
+build/
+install/
+log/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Runtime and temporary files
+.cache/
+*.log
+*.pid
+core
+core.*
+
+# ROS bags and large recording files
+*.db3
+*.mcap
+*.bag
+*.bag.active
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# ROS 2 / colcon generated files
+build/
+install/
+log/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Runtime and temporary files
+.cache/
+*.log
+*.pid
+core
+core.*
+
+# ROS bags and large recording files
+*.db3
+*.mcap
+*.bag
+*.bag.active
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# ROS 2 / colcon generated files
+build/
+install/
+log/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Runtime and temporary files
+.cache/
+*.log
+*.pid
+core
+core.*
+
+# ROS bags and large recording files
+*.db3
+*.mcap
+*.bag
+*.bag.active
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# ROS 2 / colcon
+build/
+install/
+log/
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Runtime
+.cache/
+*.log
+*.pid
+core
+core.*
+
+# ROS bags
+*.db3
+*.mcap
+*.bag
+*.bag.active
+
+# Large runtime mapping data
+mapping_sessions/**/rosbag*/
+mapping_sessions/**/*.db3
+mapping_sessions/**/*.mcap
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+*token*
+*secret*

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CycloneDDS
+  xmlns="https://cdds.io/config"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+  <Domain Id="any">
+    <General>
+      <Interfaces>
+        <!-- Keep the local supervisor control path off the removable LiDAR link. -->
+        <NetworkInterface
+          name="lo"
+          priority="10"
+          multicast="true"
+          presence_required="true"/>
+        <NetworkInterface
+          name="enp5s0"
+          priority="0"
+          multicast="true"
+          presence_required="false"/>
+      </Interfaces>
+      <AllowMulticast>default</AllowMulticast>
+      <MaxMessageSize>65500B</MaxMessageSize>
+    </General>
+    <Internal>
+      <Watermarks>
+        <WhcHigh>10MB</WhcHigh>
+      </Watermarks>
+    </Internal>
+  </Domain>
+</CycloneDDS>

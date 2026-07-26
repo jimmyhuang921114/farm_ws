@@ -1,0 +1,9 @@
+sensor_health_monitor:
+  ros__parameters:
+    lidar_packets_topic: /velodyne_packets
+    lidar_points_topic: /velodyne_points
+    imu_topic: /imu
+    camera_image_topic: /camera/color/image_raw
+    camera_info_topic: /camera/color/camera_info
+    glim_tf_topic: /tf
+    stale_after_sec: 2.0

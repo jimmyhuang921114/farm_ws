@@ -1,0 +1,185 @@
+<?xml version="1.0"?>
+
+<robot
+  xmlns:xacro="http://www.ros.org/wiki/xacro"
+  name="farm_sensor_rig">
+
+  <!--
+    true:
+      URDF 發布 livox_frame -> livox_imu
+
+    false:
+      由 Livox Driver 或其他節點發布
+  -->
+  <xacro:arg
+    name="publish_livox_imu_tf"
+    default="true"/>
+
+  <!--
+    true:
+      URDF 發布 camera_link -> camera_color_optical_frame
+
+    false:
+      由 RealSense Driver 或其他 Camera Driver 發布
+  -->
+  <xacro:arg
+    name="publish_camera_optical_tf"
+    default="false"/>
+
+  <!-- 外參集中放在此檔案 -->
+  <xacro:include filename="sensor_extrinsics.xacro"/>
+
+
+  <!-- ========================================================= -->
+  <!-- Base link                                                 -->
+  <!-- ========================================================= -->
+
+  <link name="${base_frame}">
+
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+
+      <geometry>
+        <box size="0.10 0.10 0.03"/>
+      </geometry>
+
+      <material name="base_material">
+        <color rgba="0.3 0.3 0.3 1.0"/>
+      </material>
+    </visual>
+
+  </link>
+
+
+  <!-- ========================================================= -->
+  <!-- MID-360 LiDAR                                             -->
+  <!-- ========================================================= -->
+
+  <link name="${lidar_frame}">
+
+    <visual>
+      <origin xyz="0 0 0.03" rpy="0 0 0"/>
+
+      <geometry>
+        <cylinder radius="0.04" length="0.06"/>
+      </geometry>
+
+      <material name="lidar_material">
+        <color rgba="0.1 0.1 0.1 1.0"/>
+      </material>
+    </visual>
+
+  </link>
+
+  <joint name="base_to_livox_joint" type="fixed">
+
+    <parent link="${base_frame}"/>
+    <child link="${lidar_frame}"/>
+
+    <origin
+      xyz="${base_to_lidar_xyz}"
+      rpy="${base_to_lidar_rpy}"/>
+
+  </joint>
+
+
+  <!-- ========================================================= -->
+  <!-- MID-360 internal IMU                                      -->
+  <!-- ========================================================= -->
+
+  <xacro:if value="$(arg publish_livox_imu_tf)">
+
+    <link name="${imu_frame}">
+
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+
+        <geometry>
+          <box size="0.015 0.015 0.015"/>
+        </geometry>
+
+        <material name="imu_material">
+          <color rgba="0.9 0.5 0.1 1.0"/>
+        </material>
+      </visual>
+
+    </link>
+
+    <joint name="livox_to_imu_joint" type="fixed">
+
+      <parent link="${lidar_frame}"/>
+      <child link="${imu_frame}"/>
+
+      <origin
+        xyz="${lidar_to_imu_xyz}"
+        rpy="${lidar_to_imu_rpy}"/>
+
+    </joint>
+
+  </xacro:if>
+
+
+  <!-- ========================================================= -->
+  <!-- Camera                                                    -->
+  <!-- ========================================================= -->
+
+  <link name="${camera_frame}">
+
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+
+      <geometry>
+        <box size="0.09 0.025 0.025"/>
+      </geometry>
+
+      <material name="camera_material">
+        <color rgba="0.1 0.2 0.8 1.0"/>
+      </material>
+    </visual>
+
+  </link>
+
+  <joint name="base_to_camera_joint" type="fixed">
+
+    <parent link="${base_frame}"/>
+    <child link="${camera_frame}"/>
+
+    <origin
+      xyz="${base_to_camera_xyz}"
+      rpy="${base_to_camera_rpy}"/>
+
+  </joint>
+
+
+  <!-- ========================================================= -->
+  <!-- Generic camera optical frame                              -->
+  <!--                                                           -->
+  <!-- RealSense Driver 有發布 TF 時，請保持 false               -->
+  <!-- ========================================================= -->
+
+  <xacro:if value="$(arg publish_camera_optical_tf)">
+
+    <link name="${camera_optical_frame}"/>
+
+    <joint name="camera_to_optical_joint" type="fixed">
+
+      <parent link="${camera_frame}"/>
+      <child link="${camera_optical_frame}"/>
+
+      <!--
+        ROS Camera optical convention:
+
+        optical Z: forward
+        optical X: right
+        optical Y: down
+      -->
+      <origin
+        xyz="0 0 0"
+        rpy="-1.57079632679 0 -1.57079632679"/>
+
+    </joint>
+
+  </xacro:if>
+
+</robot>
+

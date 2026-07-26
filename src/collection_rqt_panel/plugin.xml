@@ -1,0 +1,16 @@
+<library path="src">
+  <class
+    name="Collection/Collection Panel"
+    type="collection_rqt_panel.panel.CollectionPanel"
+    base_class_type="rqt_gui_py::Plugin">
+    <description>
+      Collection session, sensor health, GLIM mapping, and coverage preview.
+    </description>
+    <qtgui>
+      <group><label>Collection</label></group>
+      <label>Collection Panel</label>
+      <icon type="theme">media-record</icon>
+      <statustip>Monitor UI-only collection and mapping coverage</statustip>
+    </qtgui>
+  </class>
+</library>

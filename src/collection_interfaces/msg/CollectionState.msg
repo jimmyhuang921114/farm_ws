@@ -1,0 +1,15 @@
+uint8 IDLE=0
+uint8 PREFLIGHT=1
+uint8 COUNTDOWN=2
+uint8 RECORDING=3
+uint8 FINALIZING=4
+uint8 VERIFYING=5
+uint8 COMPLETED=6
+uint8 FAILED=7
+uint8 state
+float32 elapsed_sec
+float32 remaining_sec
+uint64 bag_size_bytes
+float32 disk_free_gb
+string session_path
+string detail

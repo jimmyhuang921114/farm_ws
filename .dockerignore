@@ -1,0 +1,16 @@
+.git
+build
+install
+log
+logs
+mapping_sessions
+**/__pycache__
+**/build
+**/install
+**/log
+src/ws_livox/build
+src/ws_livox/install
+src/ws_livox/log
+frames_*.gv
+frames_*.pdf
+

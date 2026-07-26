@@ -1,0 +1,24 @@
+camera:
+  ros__parameters:
+    camera_name: camera
+    camera_namespace: ""
+    enable_color: true
+    # The connected D435i currently enumerates as USB 2.1. The driver exposes
+    # 1280x720 at 15 FPS maximum on that link; USB 3 is required to restore the
+    # target 1280x720x30 profile.
+    rgb_camera.color_profile: 1280x720x15
+    rgb_camera.color_format: RGB8
+    enable_depth: false
+    enable_infra: false
+    enable_infra1: false
+    enable_infra2: false
+    enable_gyro: false
+    enable_accel: false
+    enable_motion: false
+    pointcloud.enable: false
+    align_depth.enable: false
+    publish_tf: true
+    tf_publish_rate: 0.0
+    base_frame_id: camera_link
+    initial_reset: false
+    reconnect_timeout: 6.0

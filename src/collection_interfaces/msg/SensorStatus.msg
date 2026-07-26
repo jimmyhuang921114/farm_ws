@@ -1,0 +1,11 @@
+uint8 UNKNOWN=0
+uint8 WAITING=1
+uint8 OK=2
+uint8 WARNING=3
+uint8 ERROR=4
+string name
+string topic
+uint8 status
+float32 measured_rate_hz
+float32 last_message_age_sec
+string detail

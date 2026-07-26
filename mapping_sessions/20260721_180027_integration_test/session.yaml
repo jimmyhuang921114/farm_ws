@@ -1,0 +1,10 @@
+session_name: integration_test
+location: lab
+duration_sec: 0.5
+profile: livox_mid360
+note: runtime_validation
+ui_only: true
+mode: ui_only
+contains_real_sensor_data: false
+contains_mcap: false
+created_at: '2026-07-21T18:00:27.237459+00:00'

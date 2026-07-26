@@ -1,0 +1,10 @@
+string session_name
+string location
+float32 duration_sec
+string profile
+string note
+bool ui_only
+---
+bool success
+string message
+string session_path
