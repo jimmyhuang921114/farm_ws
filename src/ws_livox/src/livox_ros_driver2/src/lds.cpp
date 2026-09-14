@@ -113,13 +113,6 @@ void Lds::StorageImuData(ImuData* imu_data) {
   }
 
   LidarDevice *p_lidar = &lidars_[index];
-  static uint32_t imu_diagnostic_count = 0;
-  if (imu_diagnostic_count < 5) {
-    printf("[LIVOX_DIAG][B-IMU] cache_ret=%d index=%u state=%u\n",
-        ret, index, static_cast<unsigned>(p_lidar->connect_state));
-    ++imu_diagnostic_count;
-  }
-
   LidarImuDataQueue* imu_queue = &p_lidar->imu_data;
   imu_queue->Push(imu_data);
   if (!imu_queue->Empty()) {
@@ -166,32 +159,11 @@ void Lds::StoragePointData(PointFrame* frame) {
 
     uint8_t index = 0;
     int8_t ret = cache_index_.GetIndex(lidar_point.lidar_type, lidar_point.handle, index);
-    static uint32_t storage_diagnostic_count = 0;
-    if (storage_diagnostic_count < 5) {
-      printf("[LIVOX_DIAG][B] lidar_type=%u handle=%u cache_ret=%d index=%u state=%u\n",
-          lidar_point.lidar_type, lidar_point.handle, ret, index,
-          ret == 0 ? static_cast<unsigned>(lidars_[index].connect_state) : 255U);
-      ++storage_diagnostic_count;
-    }
     if (ret != 0) {
       printf("Storage point data failed, lidar type:%u, handle:%u.\n", lidar_point.lidar_type, lidar_point.handle);
       continue;
     }
-    /*
-     * Fallback for MID-360 raw data: a valid point frame proves that
-     * the configured LiDAR is already sampling. This prevents valid
-     * point and IMU queues from being blocked when the SDK state-change
-     * callback does not update connect_state.
-     */
-    LidarDevice *p_lidar = &lidars_[index];
-    if (p_lidar->connect_state != kConnectStateSampling) {
-      printf(
-          "[LIVOX] Valid point data received; changing lidar[%u] "
-          "state from %u to sampling.\n",
-          index,
-          static_cast<unsigned int>(p_lidar->connect_state));
-      p_lidar->connect_state = kConnectStateSampling;
-    }
+    lidars_[index].connect_state = kConnectStateSampling;
     PushLidarData(&lidar_point, index, base_time);
   }
 }
@@ -212,13 +184,6 @@ void Lds::PushLidarData(PointPacket* lidar_data, const uint8_t index, const uint
 
   if (!QueueIsFull(queue)) {
     QueuePushAny(queue, (uint8_t *)lidar_data, base_time);
-    static uint32_t queue_diagnostic_count = 0;
-    if (queue_diagnostic_count < 5) {
-      printf("[LIVOX_DIAG][C] index=%u initialized=%u used=%u semaphore_before=%d\n",
-          index, queue->storage_packet != nullptr, QueueUsedSize(queue),
-          pcd_semaphore_.GetCount());
-      ++queue_diagnostic_count;
-    }
     if (!QueueIsEmpty(queue)) {
       if (pcd_semaphore_.GetCount() <= 0) {
         pcd_semaphore_.Signal();

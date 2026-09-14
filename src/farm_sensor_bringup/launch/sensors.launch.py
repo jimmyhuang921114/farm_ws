@@ -31,6 +31,10 @@ def generate_launch_description():
         DeclareLaunchArgument('start_velodyne', default_value='true'),
         DeclareLaunchArgument('start_imu', default_value='true'),
         DeclareLaunchArgument('start_realsense', default_value='true'),
+        DeclareLaunchArgument('velodyne_config_file', default_value='/workspace/farm_ws/config/sensors/velodyne.yaml'),
+        DeclareLaunchArgument('velodyne_calibration_file', default_value='/workspace/farm_ws/config/velodyne/VLP16db.yaml'),
+        DeclareLaunchArgument('fdilink_config_file', default_value='/workspace/farm_ws/config/sensors/fdilink.yaml'),
+        DeclareLaunchArgument('realsense_config_file', default_value='/workspace/farm_ws/config/sensors/realsense.yaml'),
         DeclareLaunchArgument('publish_static_tf', default_value='true'),
         DeclareLaunchArgument('camera_extrinsics_configured', default_value='false'),
         DeclareLaunchArgument('enable_semantic_projection', default_value='false'),
@@ -41,9 +45,24 @@ def generate_launch_description():
         DeclareLaunchArgument('camera_pitch', default_value='0.0'),
         DeclareLaunchArgument('camera_yaw', default_value='0.0'),
         OpaqueFunction(function=validate_extrinsics),
-        include('velodyne.launch.py', 'start_velodyne'),
-        include('fdilink.launch.py', 'start_imu'),
-        include('realsense.launch.py', 'start_realsense'),
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(PathJoinSubstitution([
+                FindPackageShare('farm_sensor_bringup'), 'launch', 'velodyne.launch.py'])),
+            launch_arguments={
+                'velodyne_config_file': LaunchConfiguration('velodyne_config_file'),
+                'velodyne_calibration_file': LaunchConfiguration('velodyne_calibration_file'),
+            }.items(),
+            condition=IfCondition(LaunchConfiguration('start_velodyne'))),
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(PathJoinSubstitution([
+                FindPackageShare('farm_sensor_bringup'), 'launch', 'fdilink.launch.py'])),
+            launch_arguments={'fdilink_config_file': LaunchConfiguration('fdilink_config_file')}.items(),
+            condition=IfCondition(LaunchConfiguration('start_imu'))),
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(PathJoinSubstitution([
+                FindPackageShare('farm_sensor_bringup'), 'launch', 'realsense.launch.py'])),
+            launch_arguments={'realsense_config_file': LaunchConfiguration('realsense_config_file')}.items(),
+            condition=IfCondition(LaunchConfiguration('start_realsense'))),
         Node(
             package='tf2_ros', executable='static_transform_publisher',
             name='base_to_velodyne_static_tf',

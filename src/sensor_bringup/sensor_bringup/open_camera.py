@@ -8,7 +8,10 @@ from typing import List, Optional, Tuple
 from urllib.parse import urlparse
 
 import cv2
-import pyudev
+try:
+    import pyudev
+except ImportError:
+    pyudev = None
 import rclpy
 import yaml
 from cv_bridge import CvBridge
@@ -19,7 +22,7 @@ from rclpy.qos import (
     QoSProfile,
     ReliabilityPolicy,
 )
-from sensor_msgs.msg import CameraInfo, Image
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 
 
 class UsbCameraPublisher(Node):
@@ -35,6 +38,10 @@ class UsbCameraPublisher(Node):
         self.declare_parameter(
             'image_topic',
             '/decxin_camera/image_raw',
+        )
+        self.declare_parameter(
+            'compressed_image_topic',
+            '/decxin_camera/image_compressed',
         )
         self.declare_parameter(
             'frame_id',
@@ -64,6 +71,9 @@ class UsbCameraPublisher(Node):
 
         self.image_topic = str(
             self.get_parameter('image_topic').value
+        )
+        self.compressed_image_topic = str(
+            self.get_parameter('compressed_image_topic').value
         )
 
         self.frame_id = str(
@@ -109,7 +119,7 @@ class UsbCameraPublisher(Node):
         if self.fps <= 0.0:
             self.fps = 30.0
 
-        self.udev_context = pyudev.Context()
+        self.udev_context = pyudev.Context() if pyudev is not None else None
         self.bridge = CvBridge()
 
         image_qos = QoSProfile(
@@ -126,6 +136,11 @@ class UsbCameraPublisher(Node):
         self.camera_info_publisher = self.create_publisher(
             CameraInfo,
             '/decxin_camera/camera_info',
+            image_qos,
+        )
+        self.compressed_publisher = self.create_publisher(
+            CompressedImage,
+            self.compressed_image_topic,
             image_qos,
         )
         self.camera_info = self.load_camera_info(self.camera_info_url)
@@ -242,6 +257,9 @@ class UsbCameraPublisher(Node):
         # Fallback: pyudev. This generally works for paths directly
         # under /dev, but may fail for /host/dev paths in Docker.
         # --------------------------------------------------------
+        if pyudev is None:
+            return None, None
+
         try:
             if video_path.startswith('/dev/'):
                 video_device = pyudev.Device.from_device_file(
@@ -552,6 +570,14 @@ class UsbCameraPublisher(Node):
 
             publish_start = time.monotonic()
             self.publisher.publish(image_message)
+            ok, encoded = cv2.imencode(
+                '.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if ok:
+                compressed = CompressedImage()
+                compressed.header = image_message.header
+                compressed.format = 'jpeg'
+                compressed.data = encoded.tobytes()
+                self.compressed_publisher.publish(compressed)
             if self.camera_info is not None:
                 self.camera_info.header = image_message.header
                 self.camera_info_publisher.publish(self.camera_info)

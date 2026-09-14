@@ -130,16 +130,6 @@ void Lddc::DistributePointCloudData(void) {
     uint32_t lidar_id = i;
     LidarDevice *lidar = &lds_->lidars_[lidar_id];
     LidarDataQueue *p_queue = &lidar->data;
-    if (i == 0) {
-      static uint32_t distribution_diagnostic_count = 0;
-      if (distribution_diagnostic_count < 5) {
-        printf("[LIVOX_DIAG][D] index=%u state=%u queue_initialized=%u used=%u action=%s\n",
-            lidar_id, static_cast<unsigned>(lidar->connect_state),
-            p_queue->storage_packet != nullptr, QueueUsedSize(p_queue),
-            kConnectStateSampling == lidar->connect_state ? "poll" : "continue_state");
-        ++distribution_diagnostic_count;
-      }
-    }
     if ((kConnectStateSampling != lidar->connect_state) || (p_queue == nullptr)) {
       continue;
     }
@@ -650,12 +640,6 @@ PublisherPtr Lddc::GetCurrentImuPublisher(uint8_t handle) {
 }
 #elif defined BUILDING_ROS2
 std::shared_ptr<rclcpp::PublisherBase> Lddc::GetCurrentPublisher(uint8_t handle) {
-  static uint32_t publisher_diagnostic_count = 0;
-  if (publisher_diagnostic_count < 5) {
-    printf("[LIVOX_DIAG][E] GetCurrentPublisher handle=%u multi_topic=%u existing=%u\n",
-        handle, use_multi_topic_, use_multi_topic_ ? private_pub_[handle] != nullptr : global_pub_ != nullptr);
-    ++publisher_diagnostic_count;
-  }
   uint32_t queue_size = kMinEthPacketQueueSize;
   if (use_multi_topic_) {
     if (!private_pub_[handle]) {

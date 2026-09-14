@@ -6,14 +6,15 @@
   <Domain Id="any">
     <General>
       <Interfaces>
-        <!-- Keep the local supervisor control path off the removable LiDAR link. -->
+        <!-- This file is a launcher template. @LIVOX_INTERFACE@ is replaced
+             with the selected Ethernet interface in the runtime log directory. -->
         <NetworkInterface
           name="lo"
           priority="10"
           multicast="true"
           presence_required="true"/>
         <NetworkInterface
-          name="enp5s0"
+          name="@LIVOX_INTERFACE@"
           priority="0"
           multicast="true"
           presence_required="false"/>

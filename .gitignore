@@ -1,60 +1,44 @@
-build/
-install/
-log/
-bags/
-output/
+# ROS 2 / colcon generated files
+/build/
+/install/
+/log/
+/logs/
+src/**/build/
+src/**/install/
+src/**/log/
+**/compile_commands.json
+*.o
+*.a
+*.so
+*.so.*
+
+# Local checkouts of external dependencies
+/src/gtsam_points/
+/src/iridescence/
+
+# Runtime collection and mapping output
+/bags/
+/output/
+/data/
+/mapping_sessions/
 *.mcap
 *.db3
 *.bag
+*.bag.active
 *.ply
 *.pcd
+*.las
+*.laz
 
-# ROS 2 / colcon generated files
-build/
-install/
-log/
-logs/
+# Generated diagrams, exports, and local reports
+/frames_*.gv
+/frames_*.pdf
 
-# Python
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.venv/
-venv/
-
-# Editors
-.vscode/
-.idea/
-*.swp
-*~
-
-# Runtime and temporary files
-.cache/
-*.log
-*.pid
-core
-core.*
-
-# ROS bags and large recording files
-*.db3
-*.mcap
-*.bag
-*.bag.active
-
-# Secrets
-.env
-.env.*
-!.env.example
-*.pem
-*.key
-credentials.json
-
-# ROS 2 / colcon generated files
-build/
-install/
-log/
-logs/
+# Backups and editor leftovers
+*.bak
+*.orig
+*.rej
+*.before_sampling_fix*
 
 # Python
 __pycache__/
@@ -76,99 +60,8 @@ venv/
 *.pid
 core
 core.*
-
-# ROS bags and large recording files
-*.db3
-*.mcap
-*.bag
-*.bag.active
-
-# Secrets
-.env
-.env.*
-!.env.example
-*.pem
-*.key
-credentials.json
-
-# ROS 2 / colcon generated files
-build/
-install/
-log/
-logs/
-
-# Python
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.venv/
-venv/
-
-# Editors
-.vscode/
-.idea/
-*.swp
-*~
-
-# Runtime and temporary files
-.cache/
-*.log
-*.pid
-core
-core.*
-
-# ROS bags and large recording files
-*.db3
-*.mcap
-*.bag
-*.bag.active
-
-# Secrets
-.env
-.env.*
-!.env.example
-*.pem
-*.key
-credentials.json
-
-# ROS 2 / colcon
-build/
-install/
-log/
-logs/
-
-# Python
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.venv/
-venv/
-
-# Editors
-.vscode/
-.idea/
-*.swp
-*~
-
-# Runtime
-.cache/
-*.log
-*.pid
-core
-core.*
-
-# ROS bags
-*.db3
-*.mcap
-*.bag
-*.bag.active
-
-# Large runtime mapping data
-mapping_sessions/**/rosbag*/
-mapping_sessions/**/*.db3
-mapping_sessions/**/*.mcap
+*.tmp
+*.temp
 
 # Secrets
 .env

@@ -246,6 +246,12 @@ private:
       ++consecutive_drops_;
       recovery_lidar_count_ = 0;
       reason_ = quality_reasons.front();
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), static_cast<uint64_t>(warning_interval_ * 1000.0),
+        "Dropping Livox cloud: reason=%s points=%zu finite=%zu quality=%zu valid_ratio=%.3f "
+        "threshold=%d frame_id=%s lidar_stamp=%.6f imu_delta=%.6f",
+        reason_.c_str(), count, finite_count, quality_count, valid_ratio, threshold,
+        message->header.frame_id.c_str(), sensor_stamp, lidar_imu_delta_);
       publish_status();
       return;
     }

@@ -42,21 +42,6 @@ Visualization Manager:
         Reliability Policy: Best Effort
         Value: /camera/color/image_raw
       Normalize Range: true
-    - Class: rviz_imu_plugin/Imu
-      Name: FDILINK IMU
-      Enabled: true
-      Topic:
-        Depth: 1
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Best Effort
-        Value: /imu
-      Acceleration properties:
-        Enabled: false
-      Box properties:
-        Enabled: true
-      Axes properties:
-        Enabled: true
     - Class: rviz_default_plugins/PointCloud2
       Name: GLIM Registered Points
       Enabled: true

@@ -1,346 +1,338 @@
-# Farm Sensor Collection Workspace
+# Farm 感測器與 GLIM 工作區
 
-For the Livox MID-360 + DECXIN + GLIM one-command workflow, see
-[docs/livox_glim_ui.md](docs/livox_glim_ui.md).
+這是以 ROS 2 Humble 建立的農場感測器工作區。目前建議使用的整合流程是：
 
-## 1. Overview
-
-This ROS 2 Humble workspace integrates a Velodyne VLP-16, an FDILINK AHRS, an optional Intel RealSense camera, sensor-health reporting, an operator RQT panel, and GLIM LiDAR-inertial mapping. It also vendors separate Livox SDK/driver and FAST-Calib projects. The active project bringup uses Velodyne, not Livox.
-
-The collection UI currently validates session metadata and timing only. `collection_manager` deliberately rejects non-UI-only preflight requests and never starts `rosbag2`; real bags must be recorded separately. Static inspection confirms interfaces and configuration, but not current hardware availability or calibration accuracy.
-
-Repository links use container paths (`/workspace/farm_ws`); on the host this checkout is mounted at `/home/jimmy/farm_ws`.
-
-## 2. System Architecture
-
-```mermaid
-flowchart LR
-  VLP[Velodyne VLP-16] --> VD[velodyne_driver]
-  VD -->|/velodyne_packets| VP[velodyne_pointcloud]
-  VP -->|/velodyne_points| HM[sensor_health_monitor]
-  VP -->|/velodyne_points| GLIM[glim_ros]
-  IMU[FDILINK AHRS] --> FD[fdilink_ahrs]
-  FD -->|/imu| HM
-  FD -->|/imu| GLIM
-  CAM[RealSense camera] --> RS[realsense2_camera]
-  RS -->|image and CameraInfo| HM
-  GLIM -->|/tf and private map/odometry topics| HM
-  HM -->|/collection/sensor_status| UI[RQT Collection Panel]
-  CI[collection_interfaces] -. message/service types .-> HM
-  CI -. message/service types .-> CM[collection_manager]
-  CI -. message/service types .-> UI
-  UI -->|/collection/* services| CM
-  CM -->|state and events| UI
-  CM -->|session.yaml and events.json| OUT[mapping_sessions]
-  BAG[manual ros2 bag record] -->|MCAP, when operator starts it| OUT
-  LIV[Livox LiDAR] --> LDRV[livox_ros_driver2, separate upstream path]
-  LDRV -->|Livox point cloud/custom message| CAL[FAST-Calib, configured for /livox/lidar]
-  CAL -->|extrinsic result files and debug clouds| COUT[calibration output]
+```text
+Livox MID-360 ─┬─ PointCloud2 ─→ 資料檢查 ─→ GLIM 建圖 ─→ RViz
+               └─ IMU ─────────→ 座標轉換 ──┘
+DECXIN Camera ───────────────────────────────────────→ RQT / 健康監控
+Collection Manager ─→ 工作階段資訊、事件標記 ────────→ RQT
+GLIM Odometry ──────→ 路徑與覆蓋率分析 ─────────────→ RQT / RViz
 ```
 
-No source-confirmed connection exists from the Livox driver to the custom collection launches, health monitor, or configured GLIM instance. FAST-Calib reads a bag and image from configured file paths; it does not subscribe live.
+> 目前的 MID-360 與 IMU 外參只是尚未校正的預設值，不可視為正式校正結果。詳見
+> [`config/livox_mid360/CALIBRATION_REQUIRED.md`](config/livox_mid360/CALIBRATION_REQUIRED.md)。
 
-## 3. Workspace Layout
+## 最快開啟方式
+
+所有主要指令都以 Docker 容器內的 `/workspace/farm_ws` 為基準。主機端專案實際放在哪裡不影響容器內路徑。
+
+### 第一次安裝
+
+在主機執行：
+
+```bash
+git clone --recurse-submodules https://github.com/jimmyhuang921114/farm_ws.git
+cd farm_ws
+
+# 建立 Ubuntu 22.04、ROS 2 Humble、CUDA 與相關套件的映像
+./docker/build.sh
+```
+
+如果專案已經 clone，但 `src/glim` 或 `src/glim_ros2` 是空目錄：
+
+```bash
+git submodule sync --recursive
+git submodule update --init --recursive
+```
+
+### 啟動硬體與介面
+
+1. 將 MID-360 接到主機並開機。
+2. 在主機設定 LiDAR 網路：
+
+```bash
+cd /path/to/farm_ws
+sudo ./docker/setup_livox_network.sh
+```
+
+3. 開啟容器：
+
+```bash
+./docker/run.sh
+```
+
+4. 第一次進入容器時建置工作區：
+
+```bash
+cd /workspace/farm_ws
+./scripts/build_all.sh
+source install/setup.bash
+```
+
+建制LiDAR Workspace
+```
+cd livox_ros_driver2
+source  /opt/ros/humble/setup.bash
+./build.sh humble
+
+#first time colcon build the workspace
+colcon build \
+  --symlink-install \
+  --cmake-args \
+    -DROS_EDITION=ROS2 \
+    -DDISTRO_ROS=humble
+```
+
+
+-------
+```
+4. 第一次進入容器時建置工作區：
+
+cd /workspace/farm_ws/src/gtsam_points
+
+mkdir -p build
+cd build
+
+cmake ..
+make -j$(nproc)
+
+sudo make install
+sudo ldconfig
+
+```
+
+
+5. 啟動 MID-360、相機、GLIM、RQT 與 RViz：
+
+```bash
+./scripts/run_livox_glim_ui.sh
+```
+
+若要保存可重複使用的原始資料與 GLIM 結果，使用：
+
+```bash
+./scripts/run_livox_glim_ui.sh --record
+```
+
+啟動後在 Collection 面板取消 **UI only**，再執行 Preflight → Start。每次工作階段會保存於
+`mapping_sessions/<時間>_<名稱>/rosbag/`，內容包含 MID-360 原始/有效點雲、IMU、TF、相機與 GLIM
+輸出 topic；影像以 JPEG quality 85 保存，rosbag2 使用 Zstandard 檔案壓縮，GLIM 的 dump 與執行記錄則保存於
+`data/runtime/`。這些資料不會提交到 GitHub。
+
+看到 `Integrated stack is ready` 即代表主要節點已通過啟動檢查。程式會持續在前景執行；按 `Ctrl+C` 可依序停止本次啟動的節點。
+
+### 平常再次開啟
+
+映像與工作區建置完成後，通常只需要：
+
+```bash
+# 主機端
+cd /path/to/farm_ws
+sudo ./docker/setup_livox_network.sh
+./docker/run.sh
+
+# 容器內
+./scripts/run_livox_glim_ui.sh
+```
+
+離開 `docker/run.sh` 開啟的 shell 後，腳本會停止並移除開發容器；工作區內容仍保留在主機掛載的專案目錄。
+
+## 啟動選項
+
+整合啟動腳本支援：
+
+```bash
+./scripts/run_livox_glim_ui.sh --help
+./scripts/run_livox_glim_ui.sh --dry-run      # 只檢查軟體、設定與 executable
+./scripts/run_livox_glim_ui.sh --skip-camera  # 未接 DECXIN 相機時使用
+./scripts/run_livox_glim_ui.sh --headless     # 不開 RQT、RViz
+./scripts/run_livox_glim_ui.sh --no-glim      # 只啟動感測器與 Collection 服務
+```
+
+若只想查看 UI、不啟動實體感測器：
+
+```bash
+./scripts/run_ui_only.sh
+```
+
+也可分別開啟介面：
+
+```bash
+./scripts/run_rqt_only.sh
+./scripts/run_rviz_only.sh
+```
+
+這些腳本都必須在容器內執行，且需要先完成 colcon build。GUI 模式需要主機已有 X11 與正確的 `DISPLAY`；無圖形環境時請使用 `--headless`。
+
+## 目前檔案架構
 
 ```text
 farm_ws/
-├── config/                     custom runtime sensor, TF, and GLIM configuration
-├── docker/                     Ubuntu 22.04 / ROS 2 Humble development image
-├── rviz/collection.rviz        custom sensor/collection view
-├── scripts/                    build, inspection, UI, and privileged setup helpers
-└── src/
-    ├── collection_{bringup,interfaces,manager,rqt_panel}  custom collection system
-    ├── farm_sensor_bringup      custom physical-sensor integration
-    ├── sensor_health_monitor    custom health aggregation
-    ├── FAST-Calib-ROS2          third-party LiDAR-camera calibration package
-    ├── fdilink_ahrs             third-party ROS 2 IMU driver
-    ├── serial                   third-party C++ serial library
-    ├── Livox-SDK2              third-party, non-ROS Livox SDK
-    ├── ws_livox/src/livox_ros_driver2  third-party nested ROS workspace/package
-    ├── glim                    upstream GLIM core submodule
-    └── glim_ros2               upstream ROS package `glim_ros` submodule
+├── config/
+│   ├── livox_mid360/          MID-360 使用的 GLIM 設定與校正警告
+│   ├── sensors/               Velodyne、FDILINK、RealSense 舊流程設定
+│   ├── udev/                  FDILINK 裝置規則
+│   └── cyclonedds_livox.xml   Livox 網路使用的 CycloneDDS 設定
+├── data/sessions/             目前保留在專案中的工作階段資料
+├── docker/                    Dockerfile、容器啟動與 LiDAR 網路腳本
+├── rviz/                      Collection 與 Livox/GLIM 的 RViz 版面
+├── scripts/                   建置、啟動、硬體檢查與工作階段檢查工具
+├── src/
+│   ├── collection_interfaces/ Collection 自訂 msg 與 srv
+│   ├── collection_manager/    工作階段、計時、事件與選用 rosbag2 管理
+│   ├── collection_rqt_panel/  操作面板
+│   ├── collection_bringup/    Collection core/UI launch 檔
+│   ├── sensor_bringup/        MID-360 點雲檢查、IMU 轉換、相機與 GLIM supervisor
+│   ├── sensor_health_monitor/ 感測器 topic 健康狀態
+│   ├── preview_tools/         GLIM 路徑與覆蓋率預覽
+│   ├── farm_sensor_bringup/   Velodyne/FDILINK/RealSense 舊整合流程
+│   ├── camera/                尚未實作節點的 ROS 套件骨架
+│   ├── glim/                  第三方 GLIM core submodule
+│   ├── glim_ros2/             第三方 GLIM ROS 2 submodule（套件名 glim_ros）
+│   ├── Livox-SDK2/            第三方 Livox 原生 SDK
+│   ├── ws_livox/src/
+│   │   └── livox_ros_driver2/ 第三方 Livox ROS 2 driver
+│   ├── FAST-Calib-ROS2/       第三方 LiDAR/相機外參校正工具
+│   ├── fdilink_ahrs/          第三方 FDILINK IMU driver
+│   └── serial/                FDILINK 使用的 serial library
+├── build/                     colcon 建置產物，不需手動修改
+├── install/                   colcon 安裝空間；啟動前要 source
+├── log/                       colcon 記錄
+├── .gitmodules                GLIM submodule 來源
+└── VERSIONS.txt               第三方套件版本紀錄
 ```
 
-| Component | Status | Language/build | Verified responsibility |
-|---|---|---|---|
-| `collection_bringup` | Custom ROS package | Python launch, `ament_cmake` | Starts collection core/UI processes. |
-| `collection_interfaces` | Custom ROS package | ROS IDL, `ament_cmake` | Collection messages and services. |
-| `collection_manager` | Custom ROS package | Python, `ament_python` | UI-only session state machine and metadata writer. |
-| `collection_rqt_panel` | Custom ROS package | Python/Qt, `ament_python` | Operator panel and service clients. |
-| `preview_tools` | Custom ROS package | Python, `ament_python` | GLIM mapping trajectory and approximate visited-cell coverage preview for RViz, RQT, and Web adapters. |
-| `farm_sensor_bringup` | Custom ROS package | Python launch, `ament_cmake` | Velodyne/FDILINK/RealSense/TF/GLIM integration. |
-| `sensor_health_monitor` | Custom ROS package | Python, `ament_python` | Validates sensor messages, TF, and disk space. |
-| `fast_calib` | Third-party ROS package | C++14+, `ament_cmake` | Offline target-based LiDAR-camera extrinsic calibration. |
-| `fdilink_ahrs` | Third-party ROS package, locally adapted | C++14, `ament_cmake` | Serial AHRS decoding and IMU-related publishers. |
-| `serial` | Third-party ROS package | C++, `ament_cmake` | Serial-port library used by FDILINK. |
-| `Livox-SDK2` | Third-party project, not a ROS package | C/C++, CMake | Livox device communication SDK installed to `/usr/local`. |
-| `livox_ros_driver2` | Third-party ROS package in nested workspace | C++14, `ament_cmake` | Livox ROS 2 driver and custom messages. |
-| `glim` | Third-party submodule/ROS package | C++17, `ament_cmake` | GLIM mapping libraries and configuration. |
-| `glim_ros` (`glim_ros2/`) | Third-party submodule/ROS package | C++17, `ament_cmake` | ROS adapter, online/offline processing, viewer/editor. |
+`build/`、`install/`、`log/`、`logs/` 與 `mapping_sessions/` 都是執行時產物，已由 `.gitignore` 排除。
 
-Generated `build/`, `install/`, and `log/` trees—including those under `src/ws_livox`—are artifacts, not source components.
+要重新查看或重新建圖：
 
-## 4. Package Reference
+```bash
+./scripts/replay_session.sh mapping_sessions/<時間>_<名稱>
+./scripts/replay_session.sh mapping_sessions/<時間>_<名稱> --rerun-glim
+```
 
-### `collection_interfaces`
+## 主要 ROS 套件
 
-- Purpose/build: custom ROS interface package; `ament_cmake` with `rosidl_default_generators`.
-- Executables/launch/config: none.
-- Interfaces: all are described in [Custom Interfaces](#5-custom-interfaces).
-- Dependencies: `builtin_interfaces`, ROSIDL generator/runtime.
-- Topics/services/parameters/TF/actions: defines types only; no runtime entities and no actions.
-
-### `collection_manager`
-
-- Purpose/build: UI-only session state machine and filesystem metadata; `ament_python`.
-- Executable: `collection_manager` (`collection_manager.manager:main`). No package launch/config files.
-- Publishes: `/collection/state` (`CollectionState`, depth 10), `/collection/events` (`CollectionEvent`, depth 10).
-- Services: `/collection/preflight`, `/collection/start`, `/collection/stop`, `/collection/add_marker`.
-- Parameter: `session_root`, default `/workspace/farm_ws/mapping_sessions`.
-- Output: timestamped session directories with `raw/`, `config/`, `calibration/`, `reports/`, `markers/`, `session.yaml`, and `markers/events.json`. No MCAP is created.
-- Subscriptions/actions/TF: none.
-- Dependencies: `rclpy`, `collection_interfaces`, PyYAML.
-
-### `sensor_health_monitor`
-
-- Purpose/build: payload-aware topic and disk health; `ament_python`.
-- Executable: `sensor_health_monitor`. No package launch/config files; [health.yaml](config/sensors/health.yaml) is passed by `collection_core.launch.py`.
-- Subscribes with sensor-data QoS: configurable Velodyne packets (`velodyne_msgs/VelodyneScan`, if installed), point cloud, IMU, image, CameraInfo, and TF.
-- Defaults: `/velodyne_packets`, `/velodyne_points`, `/imu`, `/camera/color/image_raw`, `/camera/color/camera_info`, `/tf`; `stale_after_sec=2.0`.
-- Publishes: `/collection/sensor_status` (`SensorStatus`, depth 20), including a disk check for `/workspace/farm_ws`; warns below 10 GB free.
-- Services/actions/TF: none. Dependencies: `rclpy`, `collection_interfaces`, `sensor_msgs`, `tf2_msgs`; runtime packet checking additionally needs `velodyne_msgs`.
-
-### `collection_rqt_panel`
-
-- Purpose/build: RQT plugin; `ament_python`, Qt `.ui` resource, and [plugin.xml](src/collection_rqt_panel/plugin.xml).
-- Plugin type: `collection_rqt_panel.panel.CollectionPanel`; no console executable.
-- Subscribes: `/collection/state`, `/collection/sensor_status`, `/collection/events`.
-- Clients: the four `/collection/*` services listed above.
-- Parameters/actions/TF/publications: none.
-- Dependencies: `rclpy`, `ament_index_python`, `rqt_gui`, `rqt_gui_py`, `python_qt_binding`, `collection_interfaces`.
-- “Open folder” runs `xdg-open` on the session path and therefore requires a desktop environment.
-
-### `collection_bringup`
-
-- Purpose/build: launch-only `ament_cmake` package.
-- Launch files: `collection_core.launch.py` (manager + health), `collection_ui.launch.py` (RQT/RViz/image view), `collection_full.launch.py` (core + UI).
-- `collection_core` uses absolute config/session paths. `collection_ui` uses `/workspace/farm_ws/rviz/collection.rviz`.
-- `collection_full` arguments are `ui_only`, `start_rqt`, `start_rviz`, `start_image_view`, `start_glim`, and `start_drivers`. The last three integration flags do not start drivers or GLIM here; they only control UI or log messages. `ui_only` is declared but not forwarded to the manager.
-- Runtime entities come from the launched packages; this package defines none.
-
-### `farm_sensor_bringup`
-
-- Purpose/build: launch/config integration for physical sensors; `ament_cmake`.
-- Launch files: `velodyne.launch.py`, `fdilink.launch.py`, `realsense.launch.py`, `sensors.launch.py`, and primary integrated `sensors_with_ui.launch.py`.
-- Config: [Velodyne](config/sensors/velodyne.yaml), [FDILINK](config/sensors/fdilink.yaml), [RealSense](config/sensors/realsense.yaml), [health](config/sensors/health.yaml), [frame assumptions](config/sensors/frames.yaml), VLP-16 calibration, and [GLIM profile](config/vlp16_fdilink/config_ros.json).
-- Explicit data topics: `/velodyne_packets`, `/velodyne_points`, `/imu`, FDILINK auxiliary topics, RealSense topics, `/tf`, `/tf_static`, and GLIM topics described below.
-- TF: optional `base_link -> velodyne` identity and `velodyne -> imu_link` mounting assumption; optional configured `velodyne -> camera_link`. Both sensor transforms are marked uncalibrated in `frames.yaml`. RealSense publishes its internal TF when enabled.
-- `sensors.launch.py` arguments select drivers and transforms. Semantic projection is refused when requested without configured camera extrinsics.
-- `sensors_with_ui.launch.py` adds collection core/UI and optionally `glim_rosnode`; `ui_only:=true` skips physical sensor launch. Its GLIM `config_path` and `dump_path` are absolute.
-- Dependencies: Velodyne, FDILINK, RealSense, `glim_ros`, `tf2_ros`, collection bringup, launch libraries.
-
-No actions are defined by any custom package. Where a package section does not name a service, parameter, topic, or TF frame, none was confirmed from its source.
-
-## 5. Custom Interfaces
-
-All files are under [`src/collection_interfaces`](src/collection_interfaces/).
-
-| Interface | Fields and meaning | Confirmed producer → consumer |
+| 套件 | 類型 | 用途 |
 |---|---|---|
-| `SensorStatus.msg` | Status constants `UNKNOWN..ERROR`; `name`, monitored `topic`, `status`, measured `measured_rate_hz`, `last_message_age_sec`, `detail`. Rates are Hz and age is seconds by field name. | health monitor → RQT panel |
-| `CollectionState.msg` | State constants `IDLE..FAILED`; `state`, elapsed/remaining seconds, `bag_size_bytes`, free disk GB, session path, detail. | manager → RQT panel |
-| `CollectionEvent.msg` | ROS `Time stamp`, textual `level`, `message`, optional `marker`. | manager → RQT panel |
-| `PreflightCollection.srv` | Request: session name, location, duration seconds, profile, note, UI-only flag. Response: success, message, session path. | RQT panel/test script → manager |
-| `StartCollection.srv` | Empty request; success and message response. | RQT panel/test script → manager |
-| `StopCollection.srv` | Empty request; success and message response. | RQT panel → manager |
-| `AddMarker.srv` | Marker label request; success and message response. | RQT panel → manager |
+| `collection_interfaces` | 自製 | Collection 狀態、事件、感測器狀態與服務介面 |
+| `collection_manager` | 自製 | 建立 session、倒數、標記事件；可由參數啟用 rosbag2 |
+| `collection_rqt_panel` | 自製 | 顯示健康狀態、GLIM 狀態、覆蓋率與 Collection 控制 |
+| `collection_bringup` | 自製 | 啟動 Collection core、RQT 與 RViz |
+| `sensor_bringup` | 自製 | MID-360/IMU/DECXIN 資料前處理與 GLIM 監督 |
+| `sensor_health_monitor` | 自製 | 檢查點雲、IMU、相機與 TF 是否持續更新 |
+| `preview_tools` | 自製 | 將 `/glim_ros/odom` 轉成軌跡與覆蓋率資訊 |
+| `farm_sensor_bringup` | 自製／舊流程 | Velodyne、FDILINK、RealSense 的 launch 整合 |
+| `glim`、`glim_ros` | 第三方 | LiDAR-inertial mapping |
+| `livox_ros_driver2`、`livox_sdk2` | 第三方 | MID-360 通訊與 ROS 2 driver |
+| `fast_calib` | 第三方 | 離線 LiDAR/相機標定 |
 
-The state manager sets duration to at least 0.1 seconds, applies a fixed three-second countdown, and writes marker/event metadata. It currently leaves `bag_size_bytes` at its message default.
+## 常用工具
 
-## 6. Data and Control Flow
+| 指令 | 用途 | 執行位置 |
+|---|---|---|
+| `./docker/build.sh` | 建立開發映像 | 主機 |
+| `sudo ./docker/setup_livox_network.sh` | 設定 MID-360 網路 | 主機 |
+| `./docker/run.sh` | 建立容器並進入 shell | 主機 |
+| `./scripts/build_all.sh` | 安裝 rosdep 並建置全部套件 | 容器 |
+| `./scripts/build_glim.sh` | 只建置到 `glim_ros` | 容器 |
+| `./scripts/build_ui.sh` | 只建置 Collection UI 相關套件 | 容器 |
+| `./scripts/check_glim.sh` | 輸出 GLIM/CUDA/函式庫環境資訊 | 容器 |
+| `./scripts/run_livox_glim_ui.sh` | 啟動目前主要整合流程 | 容器 |
+| `./scripts/review_sessions.sh [路徑]` | 檢查 rosbag 與 GLIM 軌跡 | 容器 |
 
-- Sensor data: VLP-16 UDP 2368 → `velodyne_driver_node` → `/velodyne_packets` → `velodyne_transform_node` → `/velodyne_points`. FDILINK serial → `/imu` plus `/mag_pose_2d`, `/magnetic`, `/euler_angles`, `/gps/fix`, `/system_speed`, `/NED_odometry`. RealSense advertises `/camera/color/image_raw` and `/camera/color/camera_info` when launched.
-- Monitoring: the monitor validates message payload and staleness, requires a TF involving `map` before declaring “GLIM TF” healthy, checks disk, and publishes `/collection/sensor_status`.
-- Collection control: RQT calls preflight/start/stop/marker services; the manager publishes state/events and writes metadata. Real recording is not connected.
-- Calibration: FAST-Calib loads `bag_path` and `image_path` at startup, reads configured `lidar_topic` from the bag, estimates `T_cam_lidar`, writes results to `output_path`, and publishes debug clouds in frame `map` while running. Defaults are placeholders and must be replaced.
-- SLAM: configured `glim_ros` subscribes `/velodyne_points`, `/imu`, and optionally `/camera/color/image_raw`; its RViz extension publishes private `~/map`, `~/points*`, `~/aligned_points*`, `~/odom*`, and `~/pose*` topics and broadcasts configured `map`, `odom`, `base_link`, and sensor transforms.
-- GUI: `collection_ui.launch.py` starts the standalone collection plugin and optional RViz/image view. GUI availability and rendering require X11/Qt.
-- Mapping preview: `preview_tools/coverage_analyzer` converts `/glim_ros/odom`
-  into `/collection/trajectory`, `/coverage/markers`, diagnostics, and
-  `/coverage/status_json`. The JSON explicitly reports mapping mode and
-  `pure_localization=false`; see
-  [Mapping coverage preview](docs/mapping_coverage_ui.md).
+## 網路與裝置設定
 
-## 7. Requirements
+目前 Livox 主流程使用固定值：
 
-- Ubuntu 22.04 and ROS 2 Humble are fixed by [Dockerfile](docker/Dockerfile); the host may differ when Docker is used.
-- Build tools: GCC/Clang with C++14 for drivers/calibration and C++17 for GLIM, CMake (GLIM ROS requests 3.16), colcon, rosdep, Python 3, setuptools, PyYAML, pytest, PyQt5.
-- ROS: desktop, CycloneDDS RMW, RQT/RQT image view, RViz and IMU plugin, rosbag2 MCAP, Velodyne, RealSense, TF, image transport.
-- Native libraries: PCL, OpenCV, Eigen, APR, Boost, OpenMP, Metis, fmt, spdlog, GLFW, GLM, GTSAM/gtsam_points, Iridescence. GLIM viewer/GPU options can be disabled; the Docker build installs CUDA 12.6 libraries and enables CUDA by default.
-- Livox: build/install [Livox-SDK2](src/Livox-SDK2/) before `livox_ros_driver2`, which looks for SDK headers and `/usr/local/lib/liblivox_lidar_sdk_shared.so`.
-- Devices: VLP-16 Ethernet/UDP, FDILINK serial device (configured `/dev/ttyUSB0`, 921600 baud), and optional RealSense USB device. Serial access requires suitable `dialout`/udev permissions. Host network must receive the LiDAR’s UDP stream.
-- Docker defines `ROS_DOMAIN_ID=40` and `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`; host processes must match to communicate.
+| 項目 | 值 |
+|---|---|
+| 主機網卡 | `enp5s0` |
+| 主機 LiDAR 網段位址 | `192.168.113.1/24` |
+| MID-360 位址 | `192.168.113.158` |
+| DECXIN USB ID | `1bcf:2cd1` |
+| ROS Domain ID | `40` |
+| RMW | `rmw_cyclonedds_cpp` |
 
-Exact third-party pins recorded by the repository are in [VERSIONS.txt](VERSIONS.txt).
+若實際網卡或 LiDAR IP 不同，需要同步修改：
 
-## 8. Build Instructions
+- [`docker/setup_livox_network.sh`](docker/setup_livox_network.sh)
+- [`scripts/run_livox_glim_ui.sh`](scripts/run_livox_glim_ui.sh)
+- [`src/ws_livox/src/livox_ros_driver2/config/MID360_config.json`](src/ws_livox/src/livox_ros_driver2/config/MID360_config.json)
 
-Inside the project container:
+主機可先用以下指令確認：
+
+```bash
+ip -br address show enp5s0
+ping -I enp5s0 -c 3 192.168.113.158
+lsusb | grep -i '1bcf:2cd1'
+```
+
+## Topic 與資料流
+
+主要 topic 如下：
+
+| Topic | 內容 |
+|---|---|
+| `/livox/lidar` | Livox driver 原始 PointCloud2 |
+| `/livox/lidar_valid` | 經連續性與 IMU 條件檢查後送入 GLIM 的點雲 |
+| `/livox/imu` | MID-360 原始 IMU |
+| `/livox/imu_base` | 轉換到 `base_link` 且套用加速度比例後的 IMU |
+| `/decxin_camera/image_raw` | DECXIN 影像 |
+| `/glim_ros/odom` | GLIM odometry |
+| `/glim_ros/points`、`/glim_ros/map` | GLIM 配準點雲與地圖 |
+| `/coverage/status_json` | 行走距離、姿態數量與近似覆蓋率 |
+| `/collection/state` | Collection 工作階段狀態 |
+| `/collection/sensor_status` | 感測器健康資訊 |
+
+目前 `config/livox_mid360/config_ros.json` 將 GLIM 的 image topic 設為 `/glim/disabled_image`，因此 DECXIN 影像只供顯示與監控，尚未加入 GLIM 計算。
+
+## 輸出與記錄
+
+- Collection 預設在 `/workspace/farm_ws/mapping_sessions/<時間>_<名稱>/` 建立 `metadata.yaml`、`session.yaml`、marker 與報告目錄。
+- `run_livox_glim_ui.sh` 預設不錄製；使用 `--record` 後，取消 RQT 的 **UI only** 才會建立 rosbag2。
+- 錄製時保留原始與有效點雲，影像另存為 JPEG compressed topic；TF 與 pose 會一起保存，重播時 rosbag2 會自動解壓縮。
+- 啟動檢查、各節點 stdout/stderr 與效能資訊放在容器的 `/tmp/farm_ws_runtime/<UTC 時間>/`。容器移除後這些 `/tmp` 記錄不會保留。
+- `data/sessions/` 是目前專案中已有的工作階段資料；它和程式預設新建的 `mapping_sessions/` 用途不同。
+
+## 常見問題
+
+### `src/glim` 是空的
+
+```bash
+git submodule sync --recursive
+git submodule update --init --recursive
+```
+
+### 找不到 ROS 套件或 executable
 
 ```bash
 cd /workspace/farm_ws
 source /opt/ros/humble/setup.bash
-rosdep install --from-paths src --ignore-src -r -y
-colcon build --symlink-install --event-handlers console_direct+
+./scripts/build_all.sh
 source install/setup.bash
+colcon list
 ```
 
-`rosdep` is appropriate for ROS package metadata, but locally vendored/custom dependency keys may still require the Docker/native dependencies above. The repository helper uses the same command without blanket skip keys: `./scripts/install_deps.sh`.
+### LiDAR 無法連線
 
-Livox has a separate native prerequisite and a nested workspace layout. Do not reuse `src/ws_livox/build`, `install`, or `log`:
+確認 MID-360 已供電、網線 carrier 正常，再於主機重新執行：
 
 ```bash
-cd /workspace/farm_ws/src/Livox-SDK2
-mkdir -p build && cd build
-cmake .. && cmake --build .
-sudo cmake --install .
-cd /workspace/farm_ws
-source /opt/ros/humble/setup.bash
-colcon build --symlink-install --packages-select livox_ros_driver2 \
-  --cmake-args -DROS_EDITION=ROS2
+sudo ./docker/setup_livox_network.sh
 ```
 
-The SDK install changes `/usr/local` and should only be run deliberately. For the main stack, `./scripts/build_all.sh`, `build_glim.sh`, and `build_ui.sh` encode repository build selections. GLIM must build before `glim_ros`, while `collection_interfaces` must build before its Python consumers; colcon resolves this from manifests.
+### 相機未連接
 
-## 9. Runtime Configuration
-
-- Middleware: Docker uses domain 40 and CycloneDDS. No CycloneDDS XML/interface pin is committed.
-- Velodyne: `device_ip=192.168.1.201`, host helper default `192.168.1.10/24`, UDP 2368, VLP16 at 600 RPM, frame `velodyne`, 0.3–30 m filter. Override helper variables `VELODYNE_INTERFACE`, `VELODYNE_HOST_IP`, `VELODYNE_SENSOR_IP`, and `VELODYNE_UDP_PORT` on the host.
-- FDILINK: `/dev/ttyUSB0`, 921600 baud, five open retries at 1000 ms, frame `imu_link`, topic `/imu`.
-- RealSense: color only, `1280x720x15` RGB8, frame base `camera_link`; depth/motion/point cloud are disabled. Repository comments say the observed USB 2.1 link motivated 15 FPS; current hardware must be revalidated.
-- TF: [frames.yaml](config/sensors/frames.yaml) explicitly marks LiDAR/IMU/camera extrinsics uncalibrated. Do not treat defaults as calibration results.
-- GLIM: CPU module selection is active in `config.json`; topics and frames are in `config_ros.json`; IMU noise and `T_lidar_imu` are in `config_sensors.json`. `T_lidar_imu` is still an assumed mount.
-- Collection: session root defaults to `/workspace/farm_ws/mapping_sessions`; UI preflight supplies name, location, duration, profile, note, and UI-only mode.
-- Livox: driver launch files consume JSON under `src/ws_livox/src/livox_ros_driver2/config/`; edit host/LiDAR IPs for the actual device. These values are separate from Velodyne configuration.
-- Calibration: replace every `/modify/path/...` in `qr_params.yaml`, choose the recorded LiDAR topic, and verify camera intrinsics/target dimensions before running.
-
-## 10. Running the System
-
-After sourcing both ROS and the workspace:
+使用：
 
 ```bash
-source /opt/ros/humble/setup.bash
-cd /workspace/farm_ws
-source install/setup.bash
+./scripts/run_livox_glim_ui.sh --skip-camera
 ```
 
-Verified launch entry points:
+### 沒有圖形畫面
+
+確認主機已在圖形桌面工作階段並設定 `DISPLAY`。遠端或無桌面環境可改用：
 
 ```bash
-# Individual/sensor-only bringup (launches real hardware)
-ros2 launch farm_sensor_bringup velodyne.launch.py
-ros2 launch farm_sensor_bringup fdilink.launch.py
-ros2 launch farm_sensor_bringup realsense.launch.py
-ros2 launch farm_sensor_bringup sensors.launch.py start_realsense:=false
-
-# Collection manager + health monitor, no hardware launch
-ros2 launch collection_bringup collection_core.launch.py
-
-# RQT/RViz operator UI
-ros2 launch collection_bringup collection_ui.launch.py start_image_view:=false
-
-# UI-only full collection stack
-ros2 launch collection_bringup collection_full.launch.py start_drivers:=false start_glim:=false
-
-# Integrated physical sensors, collection UI, and optional GLIM
-ros2 launch farm_sensor_bringup sensors_with_ui.launch.py start_glim:=true start_realsense:=false
-
-# Offline file-based calibration (after fixing qr_params.yaml)
-ros2 launch fast_calib calib.launch.py rviz:=true
+./scripts/run_livox_glim_ui.sh --headless
 ```
 
-There is no upstream GLIM launch file in this checkout; use `sensors_with_ui.launch.py` or run `ros2 run glim_ros glim_rosnode --ros-args -p config_path:=/workspace/farm_ws/config/vlp16_fdilink`. Livox launches are under the upstream nonstandard `launch_ROS2` directory; for example `ros2 launch livox_ros_driver2 msg_MID360_launch.py`, after SDK installation and IP configuration. There is no one launch file that starts both the active custom stack and Livox.
+## 版本與環境
 
-## 11. Verification
-
-These commands are read-only except that nodes may already be running:
-
-```bash
-ros2 pkg list | grep -E 'collection_|farm_sensor|sensor_health|fdilink|glim|livox'
-ros2 pkg executables collection_manager
-ros2 pkg executables glim_ros
-ros2 node list
-ros2 topic list
-ros2 service list
-ros2 action list
-ros2 topic hz /velodyne_points
-ros2 topic hz /imu
-ros2 topic echo /collection/sensor_status --once
-ros2 topic echo /collection/state --once
-ros2 service type /collection/preflight
-ros2 doctor --report
-```
-
-Expect the custom packages, `collection_manager`/`sensor_health_monitor`, and GLIM executables after a successful build/source. With sensors running, point-cloud and IMU rates should be nonzero; the repository does not define a universal acceptable rate beyond the configured health staleness threshold. `/collection/sensor_status` should report `OK`, `WAITING`, `WARNING`, or `ERROR` based on actual payloads. `ros2 action list` is expected to show no actions from these custom packages.
-
-For manual UI-only state validation, [test_ui_only.sh](scripts/test_ui_only.sh) checks service availability, completion metadata, and absence of fake MCAP. It runs nodes for about 14 seconds and should be invoked deliberately.
-
-## 12. Typical Collection Workflow
-
-1. Connect Ethernet LiDAR, FDILINK serial, and optional camera. This is recommended practice; presence is not guaranteed by source.
-2. On the host, inspect with `./scripts/check_velodyne_network.sh` and `./scripts/check_sensor_devices.sh`. Run privileged setup scripts only after reviewing their targets.
-3. Source/build, then launch individual sensors or `sensors.launch.py`.
-4. Start `collection_core.launch.py`; inspect `/collection/sensor_status`, rates, TF, disk, and `ros2 doctor`.
-5. For the confirmed UI-only workflow, preflight and start from RQT; the manager performs a three-second countdown and timer only.
-6. Monitor state/events in RQT and actual sensor topics separately.
-7. Stop through `/collection/stop`, or wait for duration completion.
-8. Inspect `session.yaml` and `markers/events.json`. For real data, separately start/stop `ros2 bag record --storage mcap ...` and verify with `ros2 bag info`; this is recommended because the manager does not record.
-9. Optionally run FAST-Calib only after recording appropriate Livox point data and a corresponding image and correcting its placeholder parameters.
-10. Optionally run GLIM with the VLP16/FDILINK configuration and inspect TF/map outputs. Calibration quality and mapping accuracy require hardware validation.
-
-## 13. Troubleshooting
-
-- Package not found/workspace not sourced: source `/opt/ros/humble/setup.bash`, rebuild, then source `install/setup.bash`; confirm names with `colcon list`.
-- Nested artifacts: ignore/remove only targeted `src/ws_livox/{build,install,log}` artifacts before a clean top-level rebuild; never document them as packages.
-- Livox unavailable: install Livox-SDK2, verify JSON host/LiDAR IPs and host interface, then inspect driver logs. Do not reuse Velodyne IP assumptions.
-- Velodyne unavailable/network mismatch: run the read-only network check; verify interface, `192.168.1.201`, host subnet, UDP 2368, and firewall. The setup script changes host networking and requires explicit root use.
-- CycloneDDS mismatch: ensure all processes share `ROS_DOMAIN_ID=40` and `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`; if a custom CycloneDDS XML is introduced, verify its NIC exists.
-- Serial permission denied: inspect `/dev/ttyUSB0`, group membership, and the reviewed udev rule. Do not chmod devices indiscriminately.
-- Missing IMU/cloud: inspect driver nodes and `ros2 topic info -v`; compare configured topic names. Sensor-data/best-effort QoS may require a matching subscriber (`ros2 topic echo --qos-reliability best_effort ...`).
-- Missing TF: inspect `/tf` and `/tf_static` and use `tf2_echo`; camera extrinsics are intentionally absent until configured, and GLIM health requires a `map` transform.
-- GLIM has no input: verify `/velodyne_points` and `/imu`, finite values, timestamps, frames, sensor-data QoS, and `config_ros.json`. GPU library/driver mismatch may require rebuilding with `BUILD_WITH_CUDA=OFF` for diagnosis.
-- RQT plugin absent: rebuild/source, run `rqt --force-discover`, and verify `plugin.xml` plus the installed RQT resource index.
-- Interfaces not generated: build `collection_interfaces` first or `--packages-up-to collection_manager`, then re-source.
-- Collection service unavailable: launch `collection_core.launch.py` and check `/collection/preflight`. Non-UI-only requests are intentionally rejected.
-- Output permission/path errors: ensure `/workspace/farm_ws/mapping_sessions` exists and is writable; both manager and health monitor contain this absolute container path.
-- Calibration failure: placeholder paths, mismatched image/point data, incorrect intrinsics/target dimensions, or absent `lidar_topic` in the bag are the first checks.
-
-## 14. Development Notes
-
-- Add custom Python nodes to their package module plus `setup.py` console scripts; add C++ targets to the owning `CMakeLists.txt` and install rules.
-- Put shared ROS messages/services in `collection_interfaces/msg` or `srv`, launch files in a package `launch/`, and reusable configuration in the owning package or top-level `config/` when it is deployment-specific.
-- Never edit generated `build/`, `install/`, `log/`, caches, recorded sessions, calibration output, or generated frame diagrams.
-- Treat GLIM, Livox, FAST-Calib, FDILINK, and serial as upstream code; prefer adapters/configuration unless an explicit task requires an upstream patch.
-- Preserve topic, service, action, parameter, frame, package, and interface compatibility.
-- Available package tests are principally `ament_lint_auto` in CMake packages and `pytest` declarations in Python packages. Useful commands are `colcon test --packages-select <package>` and `colcon test-result --verbose`. `scripts/test_ui_only.sh` is an integration test with a bounded runtime and filesystem output.
-
-## 15. Known Limitations
-
-- Collection management is UI-only; it refuses real recording and reports zero bag size.
-- `collection_full.launch.py` does not actually start hardware or GLIM despite exposing `start_drivers`/`start_glim`; the integrated physical entry point is in `farm_sensor_bringup`.
-- Several custom launch/config paths are hard-coded to `/workspace/farm_ws`, so direct host execution at `/home/jimmy/farm_ws` needs path overrides or the container mount.
-- Camera and LiDAR/IMU extrinsics are explicitly uncalibrated; camera TF is disabled by default.
-- FAST-Calib ships placeholder input/output paths and Livox-oriented defaults; it is not wired to the active Velodyne stack.
-- The Livox driver is nested under a second workspace that contains stale/generated artifact directories.
-- FDILINK metadata contains TODO description/license fields; consult its upstream repository before redistribution.
-- Repository logs describe prior device tests, but current device presence, rates, USB transport, GPU support, and calibration remain runtime facts.
-
-## 16. License and Third-Party Components
-
-There is no confirmed workspace-wide license. Custom collection packages and bringup declare Apache-2.0 individually. `glim`, `glim_ros`, and `livox_ros_driver2` declare MIT; FAST-Calib declares GPLv2. Livox-SDK2, serial, FDILINK, and bundled libraries have their own license files or upstream terms; consult each component before distribution. Do not rely on the FDILINK package’s `TODO` license declaration.
-
-## Documentation status
-
-Verified statically: all discovered `package.xml`, `CMakeLists.txt`, Python packaging/entry points, custom interfaces, plugin metadata, launch files, primary custom node implementations, relevant upstream driver/calibration/GLIM declarations, top-level configuration, Docker/scripts, submodule metadata, and existing documentation. Launch commands and package/executable names were checked against installed rules and source files; relative links were written against the repository layout.
-
-Still requires real hardware/runtime validation: device discovery, interface/IP routing, serial access, current topic rates and QoS compatibility, camera streaming, TF correctness, extrinsic/intrinsic accuracy, real MCAP contents, Livox connectivity, GLIM map quality, GUI rendering, GPU/CUDA operation, and output permissions in the deployment environment.
+- 主機／容器基底：Ubuntu 22.04
+- ROS：ROS 2 Humble
+- CUDA image：12.6.3
+- GLIM 目前選用 CPU odometry、sub-mapping 與 global-mapping 設定；Docker image 仍包含 CUDA 建置環境。
+- 更完整的第三方版本紀錄請見 [`VERSIONS.txt`](VERSIONS.txt)。

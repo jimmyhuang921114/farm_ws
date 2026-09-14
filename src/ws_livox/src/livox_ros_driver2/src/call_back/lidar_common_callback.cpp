@@ -31,18 +31,6 @@
 namespace livox_ros {
 
 void LidarCommonCallback::OnLidarPointClounCb(PointFrame* frame, void* client_data) {
-  static uint32_t diagnostic_count = 0;
-  if (diagnostic_count < 5) {
-    const PointPacket* point =
-        (frame != nullptr && frame->lidar_num > 0) ? &frame->lidar_point[0] : nullptr;
-    printf("[LIVOX_DIAG][A] point callback=%u frame=%p lidar_num=%u lidar_type=%u handle=%u points=%lu\n",
-        diagnostic_count + 1, static_cast<void*>(frame),
-        frame == nullptr ? 0 : frame->lidar_num,
-        point == nullptr ? 0 : point->lidar_type,
-        point == nullptr ? 0 : point->handle,
-        point == nullptr ? 0UL : static_cast<unsigned long>(point->points_num));
-    ++diagnostic_count;
-  }
   if (frame == nullptr) {
     printf("LidarPointCloudCb frame is nullptr.\n");
     return;
@@ -66,14 +54,6 @@ void LidarCommonCallback::OnLidarPointClounCb(PointFrame* frame, void* client_da
 }
 
 void LidarCommonCallback::LidarImuDataCallback(ImuData* imu_data, void *client_data) {
-  static uint32_t diagnostic_count = 0;
-  if (diagnostic_count < 5) {
-    printf("[LIVOX_DIAG][A-IMU] imu callback=%u data=%p lidar_type=%u handle=%u\n",
-        diagnostic_count + 1, static_cast<void*>(imu_data),
-        imu_data == nullptr ? 0 : imu_data->lidar_type,
-        imu_data == nullptr ? 0 : imu_data->handle);
-    ++diagnostic_count;
-  }
   if (imu_data == nullptr) {
     printf("Imu data is nullptr.\n");
     return;
@@ -88,5 +68,6 @@ void LidarCommonCallback::LidarImuDataCallback(ImuData* imu_data, void *client_d
 }
 
 } // namespace livox_ros
+
 
 

@@ -42,6 +42,10 @@ class CollectionPanel(Plugin):
             'collection_panel.ui',
         )
         loadUi(ui_path, self.widget)
+        ui_only_default = os.environ.get(
+            'FARM_COLLECTION_UI_ONLY_DEFAULT', 'true').lower()
+        self.widget.uiOnlyCheck.setChecked(
+            ui_only_default in ('1', 'true', 'yes', 'on'))
         if context.serial_number() > 1:
             self.widget.setWindowTitle(
                 f'Collection Panel ({context.serial_number()})')

@@ -10,7 +10,7 @@ Visualization Manager:
   Displays:
     - Class: rviz_default_plugins/Grid
       Name: Grid
-      Enabled: true
+      Enabled: false
     - Class: rviz_default_plugins/TF
       Name: TF
       Enabled: true
@@ -20,9 +20,9 @@ Visualization Manager:
       Show Names: true
     - Class: rviz_default_plugins/PointCloud2
       Name: Livox Raw PointCloud2
-      Enabled: true
+      Enabled: false
       Topic:
-        Depth: 5
+        Depth: 1
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Best Effort
@@ -58,7 +58,7 @@ Visualization Manager:
       Axis: Z
       Size (Pixels): 2
       Style: Points
-      Decay Time: 0
+      Decay Time: 10
       Use Fixed Frame: true
     - Class: rviz_default_plugins/PointCloud2
       Name: GLIM Map
@@ -97,7 +97,7 @@ Visualization Manager:
         Value: /collection/trajectory
     - Class: rviz_default_plugins/MarkerArray
       Name: Approximate Visited Cells
-      Enabled: true
+      Enabled: false
       Topic:
         Depth: 1
         Durability Policy: Transient Local
