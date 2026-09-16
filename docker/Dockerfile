@@ -79,8 +79,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ============================================================
 
 RUN python3 -m pip install --upgrade pip && \
-    python3 -m pip install \
+    python3 -m pip install --ignore-installed \
+        sympy \
         ultralytics \
+        "lap>=0.5.12" \
         numpy \
         scipy
 

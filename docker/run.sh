@@ -6,6 +6,8 @@ IMAGE_NAME="camera_yolo_tracker:humble"
 CONTAINER_NAME="camera_yolo_tracker"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PARENT_DIR="$(dirname "$SCRIPT_DIR")"
+
 
 echo "============================================================"
 echo "Camera YOLO Tracker"
@@ -92,7 +94,7 @@ exec docker run \
     -e NVIDIA_DRIVER_CAPABILITIES=all \
     -e ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}" \
     -v /tmp/.X11-unix:/tmp/.X11-unix:rw \
-    -v "${SCRIPT_DIR}:/workspace" \
+    -v "${PARENT_DIR}:/workspace" \
     -v /dev:/dev \
     "${IMAGE_NAME}" \
     bash

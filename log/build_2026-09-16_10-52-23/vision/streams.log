@@ -1,0 +1,31 @@
+[0.276s] Invoking command in '/workspace/src/vision': PYTHONPATH=/workspace/build/vision/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/workspace/install/vision/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/vision build --build-base /workspace/build/vision/build install --record /workspace/build/vision/install.log --install-scripts $base/lib/vision --single-version-externally-managed install_data
+[0.376s] running egg_info
+[0.380s] creating ../../build/vision/vision.egg-info
+[0.380s] writing ../../build/vision/vision.egg-info/PKG-INFO
+[0.381s] writing dependency_links to ../../build/vision/vision.egg-info/dependency_links.txt
+[0.381s] writing requirements to ../../build/vision/vision.egg-info/requires.txt
+[0.381s] writing top-level names to ../../build/vision/vision.egg-info/top_level.txt
+[0.381s] writing manifest file '../../build/vision/vision.egg-info/SOURCES.txt'
+[0.392s] reading manifest file '../../build/vision/vision.egg-info/SOURCES.txt'
+[0.392s] writing manifest file '../../build/vision/vision.egg-info/SOURCES.txt'
+[0.392s] running build
+[0.392s] running build_py
+[0.393s] creating /workspace/build/vision/build/lib/vision
+[0.393s] copying vision/vision.py -> /workspace/build/vision/build/lib/vision
+[0.393s] copying vision/__init__.py -> /workspace/build/vision/build/lib/vision
+[0.394s] running install
+[0.395s] running install_lib
+[0.400s] creating /workspace/install/vision/lib/python3.10/site-packages/vision
+[0.400s] copying /workspace/build/vision/build/lib/vision/vision.py -> /workspace/install/vision/lib/python3.10/site-packages/vision
+[0.401s] copying /workspace/build/vision/build/lib/vision/__init__.py -> /workspace/install/vision/lib/python3.10/site-packages/vision
+[0.401s] byte-compiling /workspace/install/vision/lib/python3.10/site-packages/vision/vision.py to vision.cpython-310.pyc
+[0.401s] byte-compiling /workspace/install/vision/lib/python3.10/site-packages/vision/__init__.py to __init__.cpython-310.pyc
+[0.401s] running install_data
+[0.402s] creating /workspace/install/vision/share/ament_index/resource_index/packages
+[0.402s] copying resource/vision -> /workspace/install/vision/share/ament_index/resource_index/packages
+[0.402s] copying package.xml -> /workspace/install/vision/share/vision
+[0.403s] running install_egg_info
+[0.408s] Copying ../../build/vision/vision.egg-info to /workspace/install/vision/lib/python3.10/site-packages/vision-0.0.0-py3.10.egg-info
+[0.408s] running install_scripts
+[0.418s] writing list of installed files to '/workspace/build/vision/install.log'
+[0.430s] Invoked command in '/workspace/src/vision' returned '0': PYTHONPATH=/workspace/build/vision/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/workspace/install/vision/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/vision build --build-base /workspace/build/vision/build install --record /workspace/build/vision/install.log --install-scripts $base/lib/vision --single-version-externally-managed install_data
