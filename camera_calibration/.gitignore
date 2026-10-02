@@ -1,0 +1,14 @@
+.venv/
+.wheelhouse/
+__pycache__/
+*.pyc
+*.pyo
+calibration_images/*
+!calibration_images/.gitkeep
+output/*
+!output/.gitkeep
+.vscode/
+.idea/
+.DS_Store
+
+.tmp/

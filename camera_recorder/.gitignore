@@ -1,0 +1,15 @@
+.venv/
+.tools/
+__pycache__/
+*.pyc
+*.pyo
+*.avi
+*.mp4
+recordings/*
+!recordings/.gitkeep
+test_results/*.jpg
+test_results/*.png
+test_results/*.log
+.vscode/
+.idea/
+.DS_Store

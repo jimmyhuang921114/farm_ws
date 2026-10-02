@@ -1,0 +1,22 @@
+camera:
+  # Camera index (2 -> /dev/video2), or a path such as /dev/video0.
+  device: 2
+  width: 1920
+  height: 1080
+  fps: 30
+  fourcc: "MJPG"
+  name: usb_camera
+
+chessboard:
+  # INNER CORNERS, not the number of black/white squares.
+  # A 9 x 6 inner-corner board has 10 x 7 squares.
+  cols: 9
+  rows: 6
+  square_size_mm: 25.0
+
+capture:
+  target_images: 30
+  save_dir: "./calibration_images"
+
+calibration:
+  output: "./output/camera_calibration.yaml"
