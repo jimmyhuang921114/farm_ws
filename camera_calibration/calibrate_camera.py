@@ -1,197 +1,1118 @@
 #!/usr/bin/env python3
-"""Interactively collect RAW chessboard frames and calibrate a USB camera."""
-import argparse
-from datetime import datetime
-from pathlib import Path
-import sys
-import time
 
 import cv2
 import numpy as np
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
 import yaml
 
-from camera_utils import (DEFAULT_CONFIG,ChessboardDetector,create_window,
-                          load_config,make_object_points,open_camera,read_frame)
+
+# ============================================================
+# DECXIN CAMERA
+# ============================================================
+
+TARGET_VID = "1bcf"
+TARGET_PID = "2cd1"
+
+WIDTH = 640
+HEIGHT = 480
+FPS = 60
+
+# ============================================================
+# ChArUco board configuration
+# Based on your C++ detector
+# ============================================================
+
+SQUARES_X = 10
+SQUARES_Y = 14
+
+SQUARE_LENGTH = 0.020      # 20 mm
+MARKER_LENGTH = 0.015      # 15 mm
+
+ARUCO_DICT = cv2.aruco.DICT_6X6_250
+
+TARGET_IMAGES = 30
 
 
-def save_raw_frame(directory,frame):
-    """Never save preview overlays; never overwrite a previous sample."""
-    directory = Path(directory)
-    directory.mkdir(parents=True,exist_ok=True)
-    index = max((int(p.stem) for p in directory.glob('*.jpg') if p.stem.isdigit()),default=0)+1
-    ok,encoded = cv2.imencode('.jpg',frame,[cv2.IMWRITE_JPEG_QUALITY,95])
-    if not ok: raise IOError('JPEG encoding failed; sample not collected')
-    while True:
-        path = directory / f'{index:06d}.jpg'
-        try:
-            with path.open('xb') as stream:
-                stream.write(encoded.tobytes())
-            return path
-        except FileExistsError:
-            index += 1
+ROOT = Path(__file__).resolve().parent
+
+CAPTURE_DIR = ROOT / "calibration_images"
+
+OUTPUT_YAML = ROOT / "camera_info.yaml"
+
+OUTPUT_INI = ROOT / "camera_calibration.ini"
 
 
-def calibrate_samples(cfg,image_points,image_paths,size,actual=None):
-    if len(image_points) < 3:
-        raise ValueError('At least 3 samples are required; collect 20–30 varied views for a useful calibration.')
-    if len(image_points) != len(image_paths): raise ValueError('Sample/image filename count mismatch')
-    if len(image_points) < 20:
-        print('WARNING: Fewer than 20 views. Capture more varied positions, tilts and distances.')
-    obj = make_object_points(cfg['chessboard'])
-    if any(np.asarray(p).shape != (len(obj),1,2) or not np.isfinite(p).all() for p in image_points):
-        raise ValueError('Invalid chessboard image points')
-    objects = [obj.copy() for _ in image_points]
-    # Default pinhole model: k1,k2,p1,p2,k3 (no rational/fisheye flags).
-    rms,k,d,rvecs,tvecs = cv2.calibrateCamera(objects,image_points,tuple(size),None,None)
-    d = d.reshape(-1)
-    if len(d)!=5 or not np.isfinite(k).all() or not np.isfinite(d).all() or not np.isfinite(rms):
-        raise ValueError('Calibration produced non-finite values or an unexpected distortion model; output not written')
-    if k[0,0]<=0 or k[1,1]<=0:
-        raise ValueError('Invalid fx/fy (must be positive); output not written')
-    per_image = []
-    for points,path,rvec,tvec in zip(image_points,image_paths,rvecs,tvecs):
-        projected,_ = cv2.projectPoints(obj,rvec,tvec,k,d)
-        # Euclidean distance in pixels for each corner, then the arithmetic mean.
-        # This is NOT norm(residuals)/N, and is distinct from OpenCV's RMS.
-        distances = np.linalg.norm(points.reshape(-1,2)-projected.reshape(-1,2),axis=1)
-        per_image.append({'image':Path(path).name,
-                          'mean_reprojection_error':float(distances.mean()),
-                          'rms_reprojection_error':float(np.sqrt(np.mean(distances**2))),
-                          'rvec':np.asarray(rvec).reshape(-1).tolist(),
-                          'tvec_mm':np.asarray(tvec).reshape(-1).tolist()})
-    mean = float(np.mean([row['mean_reprojection_error'] for row in per_image]))
-    notes = []
-    if not (0 <= k[0,2] < size[0] and 0 <= k[1,2] < size[1]):
-        notes.append('WARNING: Principal point is outside the image. Check board dimensions and view diversity.')
-    if mean > 1.0:
-        notes.append('WARNING: High reprojection error. Consider capturing better calibration images.')
-    elif mean < .5:
-        notes.append('Calibration quality good (reprojection metric only; not independent validation).')
-    result = {'image_width':int(size[0]),'image_height':int(size[1]),
-              'camera_name':cfg['camera'].get('name','usb_camera'),
-              'camera_matrix':{'rows':3,'cols':3,'data':k.reshape(-1).tolist()},
-              'distortion_model':'plumb_bob',
-              'distortion_coefficients':{'rows':1,'cols':5,'data':d.tolist()},
-              'intrinsics':{'fx':float(k[0,0]),'fy':float(k[1,1]),'cx':float(k[0,2]),'cy':float(k[1,2])},
-              'calibration':{'rms_error':float(rms),'mean_reprojection_error':mean,
-                             'images_used':len(image_points),
-                             'error_definition':'Mean Euclidean corner distance in pixels; all views have equal corner counts',
-                             'per_image':per_image,'quality_messages':notes,
-                             'timestamp':datetime.now().astimezone().isoformat(),
-                             'opencv_version':cv2.__version__,
-                             'chessboard':dict(cfg['chessboard']),
-                             'camera_requested':dict(cfg['camera']),
-                             'camera_actual':actual,
-                             'raw_images_directory':cfg['capture']['save_dir'],
-                             'source_images':'RAW distorted color JPEGs; no corner overlays or undistortion'}}
-    best = min(per_image,key=lambda row:row['mean_reprojection_error'])
-    worst = max(per_image,key=lambda row:row['mean_reprojection_error'])
-    print('\n'+'='*40+'\nCamera Calibration Result\n'+'='*40)
-    print(f'Resolution: {size[0]} x {size[1]}\nImages used: {len(image_points)}\nRMS: {rms:.6f} px\nMean reprojection error: {mean:.6f} px\n\nCamera Matrix:')
-    for key,value in result['intrinsics'].items(): print(f'{key} = {value:.6f}')
-    print('\nDistortion:')
-    for key,value in zip(['k1','k2','p1','p2','k3'],d): print(f'{key} = {value:.9g}')
-    print('\nPer-image mean reprojection error:')
-    for row in per_image: print(f"  {row['image']}: {row['mean_reprojection_error']:.6f} px")
-    print(f"\nWorst image: {worst['image']}\nError: {worst['mean_reprojection_error']:.6f} px\nBest image: {best['image']}\nError: {best['mean_reprojection_error']:.6f} px")
-    for note in notes: print(note)
-    print('='*40)
-    return result
+# ============================================================
+# USB / VIDEO DEVICE
+# ============================================================
 
+def usb_id(device):
+    """
+    Get USB VID/PID for /dev/videoX.
+    """
 
-def save_result(path,result):
-    path = Path(path)
-    path.parent.mkdir(parents=True,exist_ok=True)
-    # Keep previous geometry before atomically replacing the requested output.
-    if path.exists():
-        backup = path.with_name(path.name+'.'+datetime.now().strftime('%Y%m%d_%H%M%S_%f')+'.bak')
-        with backup.open('xb') as stream: stream.write(path.read_bytes())
-        print(f'Previous calibration preserved: {backup}')
-    temporary = path.with_name(path.name+'.tmp')
-    temporary.write_text(yaml.safe_dump(result,sort_keys=False),encoding='utf-8')
-    temporary.replace(path)
-    print(f'Calibration saved: {path}')
+    name = Path(device).name
 
+    sys_path = (
+        Path("/sys/class/video4linux")
+        / name
+        / "device"
+    )
 
-def run(cfg):
-    cap = None
-    window = 'Camera Calibration'
-    image_points,image_paths = [],[]
-    board = cfg['chessboard']
-    target = cfg['capture']['target_images']
-    detector = ChessboardDetector(board)
-    message = 'Move the board between samples; keep all inner corners visible.'
-    message_until = time.monotonic()+5
     try:
-        create_window(window)
-        cap,actual = open_camera(cfg['camera'])
-        while True:
-            raw = read_frame(cap,cfg['camera'])
-            found,corners = detector.detect(cv2.cvtColor(raw,cv2.COLOR_BGR2GRAY))
-            preview = raw.copy()  # All overlays remain separate from saved RAW.
-            if found: cv2.drawChessboardCorners(preview,detector.pattern,corners,found)
-            lines = ['Camera Calibration',f'Resolution: {raw.shape[1]}x{raw.shape[0]}',
-                     f"Chessboard: {board['cols']} x {board['rows']} inner corners",
-                     f"Square: {board['square_size_mm']} mm",f'Captured: {len(image_points)} / {target}',
-                     'CHESSBOARD DETECTED' if found else 'NO CHESSBOARD',
-                     'SPACE Capture | C Calibrate | R Reset | Q Quit']
-            if time.monotonic()<message_until: lines.append(message)
-            for index,line in enumerate(lines):
-                position = (12,28+index*28)
-                cv2.putText(preview,line,position,cv2.FONT_HERSHEY_SIMPLEX,.65,(0,0,0),4)
-                cv2.putText(preview,line,position,cv2.FONT_HERSHEY_SIMPLEX,.65,(0,255,0) if found else (0,220,255),1)
-            cv2.imshow(window,preview)
-            key = cv2.waitKey(1)&0xff
-            if key in (ord('q'),ord('Q')) or cv2.getWindowProperty(window,cv2.WND_PROP_VISIBLE)<1: break
-            if key == 32:
-                if not found:
-                    message = 'Chessboard not detected - image NOT saved'
-                elif len(image_points)>=target:
-                    message = 'Target reached. Press C to calibrate or R to reset.'
-                else:
-                    path = save_raw_frame(cfg['capture']['save_dir'],raw)
-                    image_points.append(corners.copy())
-                    image_paths.append(path)
-                    message = f'Saved {path.name} ({len(image_points)} / {target})'
-                print(message,flush=True)
-                message_until = time.monotonic()+4
-            elif key in (ord('r'),ord('R')):
-                image_points.clear()
-                image_paths.clear()
-                message = 'Samples reset; existing RAW files retained. Numbering continues.'
-                print(message,flush=True)
-                message_until = time.monotonic()+5
-            elif key in (ord('c'),ord('C')):
-                try:
-                    result = calibrate_samples(cfg,image_points,image_paths,(raw.shape[1],raw.shape[0]),actual)
-                    save_result(cfg['calibration']['output'],result)
-                    message = 'Calibration saved. See terminal for errors and quality checks.'
-                except (ValueError,cv2.error) as exc:
-                    message = f'Calibration not saved: {exc}'
-                    print(message,file=sys.stderr,flush=True)
-                message_until = time.monotonic()+6
-    finally:
-        if cap is not None: cap.release()
-        cv2.destroyAllWindows()
+        current = sys_path.resolve()
+    except Exception:
+        return None, None
 
+    for parent in [current, *current.parents]:
+
+        vendor = parent / "idVendor"
+        product = parent / "idProduct"
+
+        if vendor.exists() and product.exists():
+
+            try:
+                vid = vendor.read_text().strip().lower()
+                pid = product.read_text().strip().lower()
+
+                return vid, pid
+
+            except Exception:
+                pass
+
+    return None, None
+
+
+def video_nodes():
+
+    devices = []
+
+    for path in Path("/dev").glob("video*"):
+
+        m = re.fullmatch(
+            r"video(\d+)",
+            path.name,
+        )
+
+        if m:
+
+            devices.append(
+                (
+                    int(m.group(1)),
+                    str(path),
+                )
+            )
+
+    devices.sort()
+
+    return [
+        device
+        for _, device in devices
+    ]
+
+
+def detect_camera():
+
+    print(
+        f"[INFO] Searching DECXIN CAMERA "
+        f"{TARGET_VID}:{TARGET_PID}"
+    )
+
+    matches = []
+
+    for device in video_nodes():
+
+        vid, pid = usb_id(device)
+
+        if (
+            vid == TARGET_VID
+            and pid == TARGET_PID
+        ):
+
+            print(
+                f"[INFO] Found USB match: "
+                f"{device}"
+            )
+
+            matches.append(device)
+
+    if not matches:
+
+        raise RuntimeError(
+            f"Camera {TARGET_VID}:{TARGET_PID} "
+            "not found."
+        )
+
+    # One USB camera can expose multiple /dev/videoX.
+    # Test which one can actually capture RGB frames.
+    for device in matches:
+
+        print(
+            f"[INFO] Testing {device}..."
+        )
+
+        cap = cv2.VideoCapture(
+            device,
+            cv2.CAP_V4L2,
+        )
+
+        if not cap.isOpened():
+
+            cap.release()
+
+            continue
+
+        cap.set(
+            cv2.CAP_PROP_FOURCC,
+            cv2.VideoWriter_fourcc(
+                *"MJPG"
+            ),
+        )
+
+        cap.set(
+            cv2.CAP_PROP_FRAME_WIDTH,
+            WIDTH,
+        )
+
+        cap.set(
+            cv2.CAP_PROP_FRAME_HEIGHT,
+            HEIGHT,
+        )
+
+        cap.set(
+            cv2.CAP_PROP_FPS,
+            FPS,
+        )
+
+        ok = False
+
+        for _ in range(10):
+
+            ret, frame = cap.read()
+
+            if (
+                ret
+                and frame is not None
+                and frame.size > 0
+            ):
+
+                ok = True
+                break
+
+        cap.release()
+
+        if ok:
+
+            print(
+                f"[INFO] Using camera: "
+                f"{device}"
+            )
+
+            return device
+
+    raise RuntimeError(
+        "USB camera exists, but no "
+        "capture-capable video node found."
+    )
+
+
+# ============================================================
+# CHARUCO BOARD
+# ============================================================
+
+def create_board():
+
+    dictionary = (
+        cv2.aruco.getPredefinedDictionary(
+            ARUCO_DICT
+        )
+    )
+
+    # Compatible with different OpenCV generations.
+    try:
+
+        board = cv2.aruco.CharucoBoard(
+            (
+                SQUARES_X,
+                SQUARES_Y,
+            ),
+            SQUARE_LENGTH,
+            MARKER_LENGTH,
+            dictionary,
+        )
+
+    except Exception:
+
+        board = (
+            cv2.aruco.CharucoBoard_create(
+                SQUARES_X,
+                SQUARES_Y,
+                SQUARE_LENGTH,
+                MARKER_LENGTH,
+                dictionary,
+            )
+        )
+
+    return dictionary, board
+
+
+# ============================================================
+# DETECTION
+# ============================================================
+
+def detect_charuco(
+    frame,
+    dictionary,
+    board,
+):
+
+    gray = cv2.cvtColor(
+        frame,
+        cv2.COLOR_BGR2GRAY,
+    )
+
+    detector_parameters = (
+        cv2.aruco.DetectorParameters()
+    )
+
+    try:
+
+        detector = cv2.aruco.ArucoDetector(
+            dictionary,
+            detector_parameters,
+        )
+
+        marker_corners, marker_ids, rejected = (
+            detector.detectMarkers(gray)
+        )
+
+    except AttributeError:
+
+        marker_corners, marker_ids, rejected = (
+            cv2.aruco.detectMarkers(
+                gray,
+                dictionary,
+                parameters=detector_parameters,
+            )
+        )
+
+    charuco_corners = None
+    charuco_ids = None
+
+    if (
+        marker_ids is not None
+        and len(marker_ids) > 0
+    ):
+
+        try:
+
+            count, charuco_corners, charuco_ids = (
+                cv2.aruco.interpolateCornersCharuco(
+                    marker_corners,
+                    marker_ids,
+                    gray,
+                    board,
+                )
+            )
+
+        except cv2.error:
+
+            return (
+                gray,
+                marker_corners,
+                marker_ids,
+                None,
+                None,
+                rejected,
+            )
+
+    return (
+        gray,
+        marker_corners,
+        marker_ids,
+        charuco_corners,
+        charuco_ids,
+        rejected,
+    )
+
+
+# ============================================================
+# SAVE ROS CAMERA INFO YAML
+# ============================================================
+
+def save_ros_yaml(
+    camera_matrix,
+    distortion,
+    rms,
+):
+
+    fx = float(
+        camera_matrix[0, 0]
+    )
+
+    fy = float(
+        camera_matrix[1, 1]
+    )
+
+    cx = float(
+        camera_matrix[0, 2]
+    )
+
+    cy = float(
+        camera_matrix[1, 2]
+    )
+
+    d = distortion.flatten().tolist()
+
+    # Make sure at least 5 values exist.
+    while len(d) < 5:
+        d.append(0.0)
+
+    data = {
+        "image_width": WIDTH,
+        "image_height": HEIGHT,
+
+        "camera_name":
+            "decxin_camera",
+
+        "camera_matrix": {
+            "rows": 3,
+            "cols": 3,
+            "data": [
+                fx,
+                0.0,
+                cx,
+
+                0.0,
+                fy,
+                cy,
+
+                0.0,
+                0.0,
+                1.0,
+            ],
+        },
+
+        "distortion_model":
+            "plumb_bob",
+
+        "distortion_coefficients": {
+            "rows": 1,
+            "cols": 5,
+            "data": [
+                float(d[0]),
+                float(d[1]),
+                float(d[2]),
+                float(d[3]),
+                float(d[4]),
+            ],
+        },
+
+        "rectification_matrix": {
+            "rows": 3,
+            "cols": 3,
+            "data": [
+                1.0, 0.0, 0.0,
+                0.0, 1.0, 0.0,
+                0.0, 0.0, 1.0,
+            ],
+        },
+
+        "projection_matrix": {
+            "rows": 3,
+            "cols": 4,
+            "data": [
+                fx, 0.0, cx, 0.0,
+                0.0, fy, cy, 0.0,
+                0.0, 0.0, 1.0, 0.0,
+            ],
+        },
+
+        "calibration_rms_error":
+            float(rms),
+    }
+
+    with OUTPUT_YAML.open(
+        "w"
+    ) as f:
+
+        yaml.safe_dump(
+            data,
+            f,
+            sort_keys=False,
+        )
+
+
+# ============================================================
+# SAVE YOUR C++ INI FORMAT
+# ============================================================
+
+def save_ini(
+    camera_matrix,
+    distortion,
+):
+
+    d = distortion.flatten().tolist()
+
+    while len(d) < 5:
+        d.append(0.0)
+
+    with OUTPUT_INI.open(
+        "w"
+    ) as f:
+
+        f.write(
+            "[Intrinsic]\n"
+        )
+
+        for i in range(3):
+
+            for j in range(3):
+
+                f.write(
+                    f"{i}_{j}="
+                    f"{camera_matrix[i, j]:.12f}\n"
+                )
+
+        f.write(
+            "\n[Distortion]\n"
+        )
+
+        f.write(
+            f"k1={d[0]:.12f}\n"
+        )
+
+        f.write(
+            f"k2={d[1]:.12f}\n"
+        )
+
+        f.write(
+            f"t1={d[2]:.12f}\n"
+        )
+
+        f.write(
+            f"t2={d[3]:.12f}\n"
+        )
+
+        f.write(
+            f"k3={d[4]:.12f}\n"
+        )
+
+
+# ============================================================
+# CALIBRATION
+# ============================================================
+
+def calibrate(
+    all_corners,
+    all_ids,
+    board,
+):
+
+    print()
+    print(
+        "======================================"
+    )
+
+    print(
+        "[INFO] Running camera calibration..."
+    )
+
+    print(
+        "======================================"
+    )
+
+    image_size = (
+        WIDTH,
+        HEIGHT,
+    )
+
+    result = (
+        cv2.aruco.calibrateCameraCharuco(
+            charucoCorners=
+                all_corners,
+
+            charucoIds=
+                all_ids,
+
+            board=
+                board,
+
+            imageSize=
+                image_size,
+
+            cameraMatrix=None,
+
+            distCoeffs=None,
+        )
+    )
+
+    (
+        rms,
+        camera_matrix,
+        distortion,
+        rvecs,
+        tvecs,
+    ) = result
+
+    print()
+    print(
+        f"RMS reprojection error: "
+        f"{rms:.6f}"
+    )
+
+    print()
+    print(
+        "Camera matrix:"
+    )
+
+    print(
+        camera_matrix
+    )
+
+    print()
+    print(
+        "Distortion:"
+    )
+
+    print(
+        distortion
+    )
+
+    save_ros_yaml(
+        camera_matrix,
+        distortion,
+        rms,
+    )
+
+    save_ini(
+        camera_matrix,
+        distortion,
+    )
+
+    print()
+    print(
+        f"[SAVE] {OUTPUT_YAML}"
+    )
+
+    print(
+        f"[SAVE] {OUTPUT_INI}"
+    )
+
+    return (
+        rms,
+        camera_matrix,
+        distortion,
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config',type=Path,default=DEFAULT_CONFIG)
-    parser.add_argument('--check-config',action='store_true',help='Validate YAML/imports without opening a camera or GUI')
-    args = parser.parse_args()
+
+    CAPTURE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    dictionary, board = (
+        create_board()
+    )
+
+    device = detect_camera()
+
+    cap = cv2.VideoCapture(
+        device,
+        cv2.CAP_V4L2,
+    )
+
+    if not cap.isOpened():
+
+        raise RuntimeError(
+            f"Cannot open {device}"
+        )
+
+    # --------------------------------------------------------
+    # MJPG
+    # --------------------------------------------------------
+
+    cap.set(
+        cv2.CAP_PROP_FOURCC,
+        cv2.VideoWriter_fourcc(
+            *"MJPG"
+        ),
+    )
+
+    cap.set(
+        cv2.CAP_PROP_FRAME_WIDTH,
+        WIDTH,
+    )
+
+    cap.set(
+        cv2.CAP_PROP_FRAME_HEIGHT,
+        HEIGHT,
+    )
+
+    cap.set(
+        cv2.CAP_PROP_FPS,
+        FPS,
+    )
+
+    # Small buffer helps reduce old frames.
+    cap.set(
+        cv2.CAP_PROP_BUFFERSIZE,
+        1,
+    )
+
+    print()
+    print(
+        "======================================"
+    )
+
+    print(
+        "DECXIN ChArUco Camera Calibration"
+    )
+
+    print(
+        "======================================"
+    )
+
+    print(
+        f"Camera: {device}"
+    )
+
+    print(
+        f"USB ID: "
+        f"{TARGET_VID}:{TARGET_PID}"
+    )
+
+    print(
+        f"Resolution: "
+        f"{WIDTH}x{HEIGHT}"
+    )
+
+    print(
+        f"Requested FPS: {FPS}"
+    )
+
+    print()
+
+    print(
+        f"Board: "
+        f"{SQUARES_X} x "
+        f"{SQUARES_Y}"
+    )
+
+    print(
+        f"Square: "
+        f"{SQUARE_LENGTH * 1000:.1f} mm"
+    )
+
+    print(
+        f"Marker: "
+        f"{MARKER_LENGTH * 1000:.1f} mm"
+    )
+
+    print(
+        "Dictionary: DICT_6X6_250"
+    )
+
+    print()
+    print(
+        "SPACE = save calibration image"
+    )
+
+    print(
+        "BACKSPACE = remove last image"
+    )
+
+    print(
+        "Q = quit"
+    )
+
+    print()
+    print(
+        f"Target: {TARGET_IMAGES} images"
+    )
+
+    print(
+        "======================================"
+    )
+
+    all_corners = []
+    all_ids = []
+
+    accepted = 0
+
+    while True:
+
+        ok, frame = cap.read()
+
+        if (
+            not ok
+            or frame is None
+        ):
+
+            print(
+                "[WARN] Camera frame failed"
+            )
+
+            continue
+
+        (
+            gray,
+            marker_corners,
+            marker_ids,
+            charuco_corners,
+            charuco_ids,
+            rejected,
+        ) = detect_charuco(
+            frame,
+            dictionary,
+            board,
+        )
+
+        display = frame.copy()
+
+        marker_count = 0
+        corner_count = 0
+
+        if (
+            marker_ids is not None
+            and len(marker_ids) > 0
+        ):
+
+            marker_count = len(
+                marker_ids
+            )
+
+            cv2.aruco.drawDetectedMarkers(
+                display,
+                marker_corners,
+                marker_ids,
+            )
+
+        if (
+            charuco_ids is not None
+            and charuco_corners is not None
+        ):
+
+            corner_count = len(
+                charuco_ids
+            )
+
+            cv2.aruco.drawDetectedCornersCharuco(
+                display,
+                charuco_corners,
+                charuco_ids,
+                (
+                    0,
+                    255,
+                    0,
+                ),
+            )
+
+        # Require enough corners to avoid useless samples.
+        valid = (
+            charuco_ids is not None
+            and corner_count >= 12
+        )
+
+        status_color = (
+            (0, 255, 0)
+            if valid
+            else (0, 0, 255)
+        )
+
+        cv2.putText(
+            display,
+
+            f"Images: "
+            f"{accepted}/{TARGET_IMAGES}",
+
+            (
+                10,
+                30,
+            ),
+
+            cv2.FONT_HERSHEY_SIMPLEX,
+
+            0.8,
+
+            (
+                255,
+                255,
+                255,
+            ),
+
+            2,
+        )
+
+        cv2.putText(
+            display,
+
+            f"Markers: "
+            f"{marker_count}  "
+            f"Corners: "
+            f"{corner_count}",
+
+            (
+                10,
+                60,
+            ),
+
+            cv2.FONT_HERSHEY_SIMPLEX,
+
+            0.7,
+
+            status_color,
+
+            2,
+        )
+
+        cv2.putText(
+            display,
+
+            (
+                "GOOD - SPACE to capture"
+                if valid
+                else
+                "Move board / improve detection"
+            ),
+
+            (
+                10,
+                90,
+            ),
+
+            cv2.FONT_HERSHEY_SIMPLEX,
+
+            0.65,
+
+            status_color,
+
+            2,
+        )
+
+        cv2.imshow(
+            "ChArUco Calibration",
+            display,
+        )
+
+        key = (
+            cv2.waitKey(1)
+            & 0xFF
+        )
+
+        # Q
+        if key in (
+            ord("q"),
+            ord("Q"),
+        ):
+
+            break
+
+        # SPACE
+        if key == 32:
+
+            if not valid:
+
+                print(
+                    "[SKIP] Not enough "
+                    "ChArUco corners."
+                )
+
+                continue
+
+            # Important: copy calibration data.
+            all_corners.append(
+                charuco_corners.copy()
+            )
+
+            all_ids.append(
+                charuco_ids.copy()
+            )
+
+            filename = (
+                CAPTURE_DIR
+                / f"calib_{accepted + 1:02d}.jpg"
+            )
+
+            cv2.imwrite(
+                str(filename),
+                frame,
+            )
+
+            accepted += 1
+
+            print(
+                f"[CAPTURE] "
+                f"{accepted:02d}/"
+                f"{TARGET_IMAGES} "
+                f"| markers="
+                f"{marker_count} "
+                f"| corners="
+                f"{corner_count}"
+            )
+
+            # Visual confirmation.
+            white = np.full_like(
+                display,
+                255,
+            )
+
+            cv2.addWeighted(
+                white,
+                0.35,
+                display,
+                0.65,
+                0,
+                display,
+            )
+
+            cv2.imshow(
+                "ChArUco Calibration",
+                display,
+            )
+
+            cv2.waitKey(100)
+
+            if (
+                accepted
+                >= TARGET_IMAGES
+            ):
+
+                print()
+                print(
+                    "[INFO] 30 images collected."
+                )
+
+                break
+
+        # Backspace
+        if key in (
+            8,
+            127,
+        ):
+
+            if accepted > 0:
+
+                accepted -= 1
+
+                all_corners.pop()
+                all_ids.pop()
+
+                filename = (
+                    CAPTURE_DIR
+                    / f"calib_{accepted + 1:02d}.jpg"
+                )
+
+                if filename.exists():
+                    filename.unlink()
+
+                print(
+                    f"[REMOVE] "
+                    f"Now {accepted}/"
+                    f"{TARGET_IMAGES}"
+                )
+
+    cap.release()
+
+    cv2.destroyAllWindows()
+
+    if accepted < TARGET_IMAGES:
+
+        print()
+        print(
+            f"[INFO] Calibration stopped "
+            f"with {accepted} images."
+        )
+
+        return
+
+    # ========================================================
+    # Calibration
+    # ========================================================
+
+    rms, matrix, distortion = calibrate(
+        all_corners,
+        all_ids,
+        board,
+    )
+
+    print()
+    print(
+        "======================================"
+    )
+
+    print(
+        "CALIBRATION COMPLETE"
+    )
+
+    print(
+        "======================================"
+    )
+
+    print(
+        f"RMS = {rms:.6f}"
+    )
+
+    print()
+    print(
+        "K ="
+    )
+
+    print(matrix)
+
+    print()
+    print(
+        "D ="
+    )
+
+    print(distortion)
+
+    print()
+    print(
+        "ROS camera info:"
+    )
+
+    print(
+        OUTPUT_YAML
+    )
+
+    print()
+    print(
+        "ChArUco detector INI:"
+    )
+
+    print(
+        OUTPUT_INI
+    )
+
+
+if __name__ == "__main__":
+
     try:
-        cfg = load_config(args.config)
-        if args.check_config:
-            print(yaml.safe_dump(cfg,sort_keys=False))
-            print(f"Config OK; object points: {make_object_points(cfg['chessboard']).shape}, units mm")
-        else: run(cfg)
-        return 0
+
+        main()
+
     except KeyboardInterrupt:
-        return 0
-    except (OSError,ValueError,RuntimeError,cv2.error,yaml.YAMLError) as exc:
-        print(f'ERROR: {exc}',file=sys.stderr)
-        return 1
 
+        print(
+            "\n[INFO] Interrupted."
+        )
 
-if __name__ == '__main__': sys.exit(main())
+    except Exception as exc:
+
+        print(
+            f"\n[ERROR] {exc}",
+            file=sys.stderr,
+        )
+
+        sys.exit(1)
