@@ -1,0 +1,3206 @@
+/*
+ * STM32F429ZI + AS5600 + SimpleFOC Mini v1.0
+ *
+ * 3PWM:
+ *   TIM4_CH1 = PD12
+ *   TIM4_CH2 = PD13
+ *   TIM4_CH3 = PD14
+ *
+ * Driver Enable:
+ *   PD11
+ *
+ * I2C1:
+ *   SCL = PB6
+ *   SDA = PB9
+ *
+ * USART3:
+ *   TX = PC12
+ *   RX = PD2
+ *   115200
+ *
+ * IMPORTANT:
+ * USART3 global interrupt must be enabled in .ioc
+ */
+#include "main.h"
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+/* ============================================================
+ * AS5600
+ * ============================================================ */
+#define AS5600_ADDR              (0x36 << 1)
+#define AS5600_STATUS_REG        0x0B
+#define AS5600_RAW_ANGLE_REG     0x0C
+/* ============================================================
+ * Motor / FOC
+ * ============================================================ */
+#define POLE_PAIRS               7.0f
+#define TWO_PI                   6.28318530718f
+#define PI_F                     3.14159265359f
+#define THREE_PI_2               4.71238898038f
+#define SUPPLY_VOLTAGE           24.9f
+#define MOTOR_VOLTAGE_LIMIT      1.5f
+#define ALIGN_VOLTAGE            1.5f
+/* ============================================================
+ * Motion limits
+ * Arduino version
+ * ============================================================ */
+#define MAX_VELOCITY             40.0f
+#define MAX_ACCELERATION         40.0f
+/* ============================================================
+ * Velocity PID
+ * Arduino:
+ *
+ * P = 0.60
+ * I = 0.27
+ * D = 0
+ * LPF = 0.16
+ * ============================================================ */
+#define VEL_KP                   0.60f
+#define VEL_KI                   0.27f
+#define VEL_KD                   0.00f
+#define VEL_LPF_TF               0.16f
+/* ============================================================
+ * Position PID
+ * Arduino:
+ *
+ * P = 4
+ * I = 0.01
+ * D = 0.262
+ * ============================================================ */
+#define POS_KP                   4.00f
+#define POS_KI                   0.01f
+#define POS_KD                   0.262f
+/* ============================================================
+ * UART
+ * ============================================================ */
+#define UART_RX_BUFFER_SIZE      64
+
+/* Mechanical yaw zero: AS5600 raw count (0..4095).
+ * -1 means uncalibrated. After ZERO, copy the reported raw count here
+ * and reflash to preserve the same physical zero after power cycling.
+ */
+#define YAW_ZERO_RAW_COUNT 3076
+#define YAW_MIN_DEG             (-100.0f)
+#define YAW_MAX_DEG             (100.0f)
+#define YAW_SIGN                (1.0f) /* change only after verifying direction */
+#define YAW_TELEMETRY_MS        (200U)
+
+/* ============================================================
+ * HAL handles
+ * ============================================================ */
+I2C_HandleTypeDef hi2c1;
+TIM_HandleTypeDef htim4;
+UART_HandleTypeDef huart3;
+/* ============================================================
+ * Motor state
+ * ============================================================ */
+static float shaft_angle = 0.0f;
+static float shaft_velocity = 0.0f;
+static float target_angle = 0.0f;
+static uint16_t yaw_zero_raw = 0;
+static uint8_t yaw_zero_valid = 0;
+static float yaw_zero_control_angle = 0.0f;
+static uint8_t yaw_outside_limit = 0;
+
+static float zero_electric_angle = 0.0f;
+static int sensor_direction = 1;
+/* ============================================================
+ * AS5600 multi-turn
+ * ============================================================ */
+static uint16_t last_raw = 0;
+static int32_t full_rotations = 0;
+static uint8_t sensor_started = 0;
+/* ============================================================
+ * Velocity PID
+ * ============================================================ */
+static float vel_integral = 0.0f;
+static float vel_prev_error = 0.0f;
+static float vel_filtered = 0.0f;
+/* ============================================================
+ * Position PID
+ * ============================================================ */
+static float pos_integral = 0.0f;
+static float pos_prev_error = 0.0f;
+/* ============================================================
+ * Acceleration limiter
+ * ============================================================ */
+static float ramped_velocity = 0.0f;
+/* ============================================================
+ * Timing
+ * ============================================================ */
+static uint32_t last_control_us = 0;
+static uint32_t last_print_ms = 0;
+/* ============================================================
+ * UART Interrupt RX
+ * ============================================================ */
+static uint8_t uart_rx_byte;
+static char uart_rx_build[UART_RX_BUFFER_SIZE];
+static volatile uint8_t uart_rx_build_index = 0;
+static char uart_command[UART_RX_BUFFER_SIZE];
+static volatile uint8_t uart_command_ready = 0;
+static volatile uint32_t uart_overflow_count = 0;
+static volatile uint32_t uart_busy_drop_count = 0;
+/* ============================================================
+ * Function prototypes
+ * ============================================================ */
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART3_UART_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_TIM4_Init(void);
+void Error_Handler(void);
+/* ============================================================
+ * Utility
+ * ============================================================ */
+static float constrainf_local(
+    float x,
+    float lo,
+    float hi
+)
+{
+    if (x < lo)
+        return lo;
+    if (x > hi)
+        return hi;
+    return x;
+}
+static float normalize_angle(float a)
+{
+    a = fmodf(a, TWO_PI);
+    if (a < 0.0f)
+        a += TWO_PI;
+    return a;
+}
+/* ============================================================
+ * DWT timer
+ * ============================================================ */
+static void DWT_Init(void)
+{
+    CoreDebug->DEMCR |=
+        CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |=
+        DWT_CTRL_CYCCNTENA_Msk;
+}
+static uint32_t micros32(void)
+{
+    return
+        DWT->CYCCNT /
+        (HAL_RCC_GetHCLKFreq() / 1000000U);
+}
+/* ============================================================
+ * UART TX
+ * ============================================================ */
+static void UART_Print(const char *s)
+{
+    HAL_UART_Transmit(
+        &huart3,
+        (uint8_t *)s,
+        strlen(s),
+        100
+    );
+}
+/* ============================================================
+ * AS5600
+ * ============================================================ */
+static HAL_StatusTypeDef AS5600_Check(void)
+{
+    return HAL_I2C_IsDeviceReady(
+        &hi2c1,
+        AS5600_ADDR,
+        3,
+        100
+    );
+}
+static HAL_StatusTypeDef AS5600_ReadStatus(
+    uint8_t *status
+)
+{
+    return HAL_I2C_Mem_Read(
+        &hi2c1,
+        AS5600_ADDR,
+        AS5600_STATUS_REG,
+        I2C_MEMADD_SIZE_8BIT,
+        status,
+        1,
+        100
+    );
+}
+static uint16_t AS5600_ReadRawAngle(void)
+{
+    uint8_t data[2];
+    if (
+        HAL_I2C_Mem_Read(
+            &hi2c1,
+            AS5600_ADDR,
+            AS5600_RAW_ANGLE_REG,
+            I2C_MEMADD_SIZE_8BIT,
+            data,
+            2,
+            100
+        )
+        != HAL_OK
+    )
+    {
+        return 0xFFFF;
+    }
+    return
+        (
+            (
+                ((uint16_t)data[0] << 8)
+                | data[1]
+            )
+            & 0x0FFF
+        );
+}
+/* ============================================================
+ * AS5600 multi-turn angle
+ * ============================================================ */
+static float Sensor_UpdateAngle(void)
+{
+    uint16_t raw =
+        AS5600_ReadRawAngle();
+    if (raw == 0xFFFF)
+    {
+        return shaft_angle;
+    }
+    if (!sensor_started)
+    {
+        last_raw = raw;
+        full_rotations = 0;
+        sensor_started = 1;
+    }
+    else
+    {
+        int32_t d =
+            (int32_t)raw
+            - (int32_t)last_raw;
+        if (d > 2048)
+        {
+            full_rotations--;
+        }
+        else if (d < -2048)
+        {
+            full_rotations++;
+        }
+        last_raw = raw;
+    }
+    float turns =
+        (float)full_rotations
+        +
+        ((float)raw / 4096.0f);
+    shaft_angle =
+        turns * TWO_PI;
+    return shaft_angle;
+}
+/* ============================================================
+ * PWM
+ * ============================================================ */
+static void PWM_SetDuty(
+    float da,
+    float db,
+    float dc
+)
+{
+    da = constrainf_local(
+        da,
+        0.0f,
+        1.0f
+    );
+    db = constrainf_local(
+        db,
+        0.0f,
+        1.0f
+    );
+    dc = constrainf_local(
+        dc,
+        0.0f,
+        1.0f
+    );
+    uint32_t arr =
+        __HAL_TIM_GET_AUTORELOAD(
+            &htim4
+        ) + 1U;
+    __HAL_TIM_SET_COMPARE(
+        &htim4,
+        TIM_CHANNEL_1,
+        (uint32_t)(da * arr)
+    );
+    __HAL_TIM_SET_COMPARE(
+        &htim4,
+        TIM_CHANNEL_2,
+        (uint32_t)(db * arr)
+    );
+    __HAL_TIM_SET_COMPARE(
+        &htim4,
+        TIM_CHANNEL_3,
+        (uint32_t)(dc * arr)
+    );
+}
+/* ============================================================
+ * Driver enable
+ * ============================================================ */
+static void Motor_Disable(void)
+{
+    PWM_SetDuty(
+        0.0f,
+        0.0f,
+        0.0f
+    );
+    HAL_GPIO_WritePin(
+        Driver_Enable_GPIO_Port,
+        Driver_Enable_Pin,
+        GPIO_PIN_RESET
+    );
+}
+static void Motor_Enable(void)
+{
+    HAL_GPIO_WritePin(
+        Driver_Enable_GPIO_Port,
+        Driver_Enable_Pin,
+        GPIO_PIN_SET
+    );
+}
+/* ============================================================
+ * FOC voltage
+ * ============================================================ */
+static void SetPhaseVoltage(
+    float Uq,
+    float electrical_angle
+)
+{
+    Uq = constrainf_local(
+        Uq,
+        -MOTOR_VOLTAGE_LIMIT,
+        MOTOR_VOLTAGE_LIMIT
+    );
+    electrical_angle =
+        normalize_angle(
+            electrical_angle
+        );
+    float Ualpha =
+        -Uq * sinf(
+            electrical_angle
+        );
+    float Ubeta =
+        Uq * cosf(
+            electrical_angle
+        );
+    float Ua =
+        Ualpha
+        +
+        SUPPLY_VOLTAGE * 0.5f;
+    float Ub =
+        (
+            -0.5f * Ualpha
+            +
+            0.86602540378f * Ubeta
+        )
+        +
+        SUPPLY_VOLTAGE * 0.5f;
+    float Uc =
+        (
+            -0.5f * Ualpha
+            -
+            0.86602540378f * Ubeta
+        )
+        +
+        SUPPLY_VOLTAGE * 0.5f;
+    PWM_SetDuty(
+        Ua / SUPPLY_VOLTAGE,
+        Ub / SUPPLY_VOLTAGE,
+        Uc / SUPPLY_VOLTAGE
+    );
+}
+/* ============================================================
+ * Direction-corrected mechanical angle
+ * ============================================================ */
+static float ControlAngle(void)
+{
+    return
+        (float)sensor_direction
+        * shaft_angle;
+}
+/* Fixed mechanical yaw zero: wrap raw difference to +/-180 deg.
+ * Valid for direct-drive AS5600 and a mechanical range smaller than 180 deg
+ * on each side of zero; no gearbox or multi-turn absolute recovery.
+ */
+static float YawFromRawDeg(uint16_t raw)
+{
+    int32_t d = (int32_t)raw - (int32_t)yaw_zero_raw;
+    if (d > 2047) d -= 4096;
+    if (d < -2048) d += 4096;
+    return YAW_SIGN * (float)d * (360.0f / 4096.0f);
+}
+
+static float CurrentYawDeg(void)
+{
+    return YawFromRawDeg(last_raw);
+}
+
+/* Map mechanical yaw coordinate into existing continuous PID coordinate.
+ * ControlAngle() includes the FOC-detected sensor direction.
+ */
+static void Yaw_UpdateReference(void)
+{
+    float yaw_rad = CurrentYawDeg() * (PI_F / 180.0f);
+    yaw_zero_control_angle = ControlAngle() -
+        ((float)sensor_direction / YAW_SIGN) * yaw_rad;
+}
+
+static float YawToControlAngle(float yaw_deg)
+{
+    return yaw_zero_control_angle +
+        ((float)sensor_direction / YAW_SIGN) *
+        yaw_deg * (PI_F / 180.0f);
+}
+
+/* ============================================================
+ * Electrical angle
+ * ============================================================ */
+static float ElectricalAngle(void)
+{
+    return normalize_angle(
+        POLE_PAIRS
+        * ControlAngle()
+        - zero_electric_angle
+    );
+}
+/* ============================================================
+ * FOC sensor alignment
+ *
+ * 自動判斷 sensor direction
+ * +
+ * electrical zero
+ * ============================================================ */
+static uint8_t FOC_AlignSensor(void)
+{
+    char b[128];
+    UART_Print(
+        "FOC alignment...\r\n"
+    );
+    Sensor_UpdateAngle();
+    float start =
+        shaft_angle;
+    /* --------------------------------------------------------
+     * Forward electrical sweep
+     * -------------------------------------------------------- */
+    for (int i = 0; i <= 500; i++)
+    {
+        float a =
+            THREE_PI_2
+            +
+            TWO_PI
+            * ((float)i / 500.0f);
+        SetPhaseVoltage(
+            ALIGN_VOLTAGE,
+            a
+        );
+        HAL_Delay(2);
+        Sensor_UpdateAngle();
+    }
+    float mid =
+        shaft_angle;
+    /* --------------------------------------------------------
+     * Sweep back
+     * -------------------------------------------------------- */
+    for (int i = 500; i >= 0; i--)
+    {
+        float a =
+            THREE_PI_2
+            +
+            TWO_PI
+            * ((float)i / 500.0f);
+        SetPhaseVoltage(
+            ALIGN_VOLTAGE,
+            a
+        );
+        HAL_Delay(2);
+        Sensor_UpdateAngle();
+    }
+    float moved =
+        mid - start;
+    if (fabsf(moved) < 0.01f)
+    {
+        UART_Print(
+            "ALIGN ERROR: sensor did not move\r\n"
+        );
+        Motor_Disable();
+        return 0;
+    }
+    sensor_direction =
+        (moved > 0.0f)
+        ? 1
+        : -1;
+    /* --------------------------------------------------------
+     * Lock rotor and determine electrical zero
+     * -------------------------------------------------------- */
+    SetPhaseVoltage(
+        ALIGN_VOLTAGE,
+        THREE_PI_2
+    );
+    HAL_Delay(700);
+    Sensor_UpdateAngle();
+    zero_electric_angle =
+        normalize_angle(
+            POLE_PAIRS
+            * ControlAngle()
+        );
+    SetPhaseVoltage(
+        0.0f,
+        0.0f
+    );
+    HAL_Delay(200);
+    snprintf(
+        b,
+        sizeof(b),
+        "Direction: %s | "
+        "Zero electrical: %.4f rad\r\n",
+        sensor_direction > 0
+            ? "CW/+"
+            : "CCW/-",
+        zero_electric_angle
+    );
+    UART_Print(b);
+    return 1;
+}
+/* ============================================================
+ * Reset controllers
+ * ============================================================ */
+static void ResetControllers(void)
+{
+    vel_integral = 0.0f;
+    vel_prev_error = 0.0f;
+    vel_filtered = 0.0f;
+    pos_integral = 0.0f;
+    pos_prev_error = 0.0f;
+    ramped_velocity = 0.0f;
+    last_control_us =
+        micros32();
+}
+/* ============================================================
+ * Cascade controller
+ *
+ * Position PID
+ *      ↓
+ * requested velocity
+ *      ↓
+ * acceleration limit
+ *      ↓
+ * ramped velocity
+ *      ↓
+ * Velocity PID
+ *      ↓
+ * Uq
+ *      ↓
+ * FOC
+ * ============================================================ */
+static void ControlLoop(void)
+{
+    uint32_t now =
+        micros32();
+    float dt =
+        (float)(
+            now - last_control_us
+        )
+        * 1e-6f;
+    if (
+        dt <= 0.0f
+        ||
+        dt > 0.05f
+    )
+    {
+        dt = 0.001f;
+    }
+    last_control_us =
+        now;
+    /* --------------------------------------------------------
+     * Sensor + velocity
+     * -------------------------------------------------------- */
+    float old_control_angle =
+        ControlAngle();
+    Sensor_UpdateAngle();
+    float control_angle =
+        ControlAngle();
+    float raw_velocity =
+        (
+            control_angle
+            - old_control_angle
+        )
+        / dt;
+    /* --------------------------------------------------------
+     * Velocity LPF
+     *
+     * Arduino SimpleFOC:
+     * LPF_velocity.Tf = 0.16
+     * -------------------------------------------------------- */
+    float alpha =
+        VEL_LPF_TF
+        /
+        (
+            VEL_LPF_TF
+            + dt
+        );
+    vel_filtered =
+        alpha
+        * vel_filtered
+        +
+        (1.0f - alpha)
+        * raw_velocity;
+    shaft_velocity =
+        vel_filtered;
+    /* ========================================================
+     * Position PID
+     * ======================================================== */
+    float pe =
+        target_angle
+        - control_angle;
+    pos_integral +=
+        pe * dt;
+    /*
+     * Arduino integral limit = 2.0
+     */
+    pos_integral =
+        constrainf_local(
+            pos_integral,
+            -2.0f,
+            2.0f
+        );
+    float pd =
+        (
+            pe
+            - pos_prev_error
+        )
+        / dt;
+    pos_prev_error =
+        pe;
+    float requested_velocity =
+        POS_KP * pe
+        +
+        POS_KI * pos_integral
+        +
+        POS_KD * pd;
+    requested_velocity =
+        constrainf_local(
+            requested_velocity,
+            -MAX_VELOCITY,
+            MAX_VELOCITY
+        );
+    /* ========================================================
+     * Acceleration limiter
+     * ======================================================== */
+    float dv_max =
+        MAX_ACCELERATION
+        * dt;
+    float dv =
+        requested_velocity
+        - ramped_velocity;
+    dv =
+        constrainf_local(
+            dv,
+            -dv_max,
+            dv_max
+        );
+    ramped_velocity +=
+        dv;
+    /* ========================================================
+     * Velocity PID
+     * ======================================================== */
+    float ve =
+        ramped_velocity
+        - shaft_velocity;
+    /*
+     * SimpleFOC style:
+     * integral already contains KI.
+     */
+    vel_integral +=
+        VEL_KI
+        * ve
+        * dt;
+    vel_integral =
+        constrainf_local(
+            vel_integral,
+            -MOTOR_VOLTAGE_LIMIT,
+            MOTOR_VOLTAGE_LIMIT
+        );
+    float vd =
+        (
+            ve
+            - vel_prev_error
+        )
+        / dt;
+    vel_prev_error =
+        ve;
+    float Uq =
+        VEL_KP * ve
+        +
+        vel_integral
+        +
+        VEL_KD * vd;
+    Uq =
+        constrainf_local(
+            Uq,
+            -MOTOR_VOLTAGE_LIMIT,
+            MOTOR_VOLTAGE_LIMIT
+        );
+    /* ========================================================
+     * FOC output
+     * ======================================================== */
+    SetPhaseVoltage(
+        Uq,
+        ElectricalAngle()
+    );
+}
+/* ============================================================
+ * UART command parser
+ *
+ * Ubuntu sends:
+ *
+ * 10.0\n
+ * -20.0\n
+ *
+ * Arduino behavior:
+ *
+ * target =
+ * CURRENT POSITION + relative command
+ * ============================================================ */
+static void UART_ProcessCommands(void)
+{
+    if (!uart_command_ready)
+    {
+        return;
+    }
+    char local_command[
+        UART_RX_BUFFER_SIZE
+    ];
+    /*
+     * Critical section:
+     * copy completed command.
+     *
+     * We only disable USART3 RXNE briefly.
+     */
+    __HAL_UART_DISABLE_IT(
+        &huart3,
+        UART_IT_RXNE
+    );
+    strncpy(
+        local_command,
+        uart_command,
+        UART_RX_BUFFER_SIZE
+    );
+    local_command[
+        UART_RX_BUFFER_SIZE - 1
+    ] = '\0';
+    uart_command_ready = 0;
+    __HAL_UART_ENABLE_IT(
+        &huart3,
+        UART_IT_RXNE
+    );
+    /* ZERO: set the physical front direction to zero in RAM.
+     * Reflash YAW_ZERO_RAW_COUNT to make it persistent.
+     * Stop ROS tracking before using this command.
+     */
+    if (strcmp(local_command, "ZERO") == 0)
+    {
+        Sensor_UpdateAngle();
+        yaw_zero_raw = last_raw;
+        yaw_zero_valid = 1;
+        Yaw_UpdateReference();
+        target_angle = ControlAngle();
+        pos_integral = 0.0f;
+        pos_prev_error = 0.0f;
+        char zmsg[96];
+        snprintf(zmsg, sizeof(zmsg),
+                 "YAW ZERO raw=%u (set YAW_ZERO_RAW_COUNT=%u to persist)\r\n",
+                 (unsigned)yaw_zero_raw, (unsigned)yaw_zero_raw);
+        UART_Print(zmsg);
+        return;
+    }
+    if (strcmp(local_command, "YAW?") == 0)
+    {
+        char ymsg[96];
+        if (yaw_zero_valid)
+            snprintf(ymsg, sizeof(ymsg), "YAW:%.2f\r\n", CurrentYawDeg());
+        else
+            snprintf(ymsg, sizeof(ymsg), "YAW UNCALIBRATED\r\n");
+        UART_Print(ymsg);
+        return;
+    }
+    if (!yaw_zero_valid)
+    {
+        UART_Print("YAW UNCALIBRATED: use ZERO at mechanical front\r\n");
+        return;
+    }
+    if (yaw_outside_limit)
+    {
+        UART_Print("YAW OUTSIDE LIMIT: commands disabled\r\n");
+        return;
+    }
+
+    /* --------------------------------------------------------
+     * Parse float
+     * -------------------------------------------------------- */
+    char *endptr = NULL;
+    float delta_deg =
+        strtof(
+            local_command,
+            &endptr
+        );
+    if (
+        endptr
+        ==
+        local_command
+    )
+    {
+        char msg[128];
+        snprintf(
+            msg,
+            sizeof(msg),
+            "UART INVALID: %s\r\n",
+            local_command
+        );
+        UART_Print(msg);
+        return;
+    }
+    /*
+     * Allow trailing spaces/tabs only.
+     */
+    while (
+        *endptr == ' '
+        ||
+        *endptr == '\t'
+    )
+    {
+        endptr++;
+    }
+    if (*endptr != '\0')
+    {
+        char msg[128];
+        snprintf(
+            msg,
+            sizeof(msg),
+            "UART INVALID FORMAT: %s\r\n",
+            local_command
+        );
+        UART_Print(msg);
+        return;
+    }
+    /* --------------------------------------------------------
+     * Safety
+     *
+     * Person tracker should never command
+     * thousands of degrees.
+     * -------------------------------------------------------- */
+    if (
+        !isfinite(delta_deg)
+        ||
+        delta_deg < -180.0f
+        ||
+        delta_deg > 180.0f
+    )
+    {
+        char msg[128];
+        snprintf(
+            msg,
+            sizeof(msg),
+            "UART REJECT: %.2f deg\r\n",
+            delta_deg
+        );
+        UART_Print(msg);
+        return;
+    }
+    /* ========================================================
+     * IMPORTANT
+     *
+     * Same behavior as Arduino:
+     *
+     * target =
+     * CURRENT POSITION + command
+     *
+     * NOT:
+     *
+     * target += command
+     * ======================================================== */
+    Sensor_UpdateAngle();
+    float current_angle =
+        ControlAngle();
+    /* Original relative-command behavior, now with a fixed yaw clamp. */
+    float current_yaw = CurrentYawDeg();
+
+    float requested_yaw =
+        current_yaw +
+        ((float)sensor_direction / YAW_SIGN) * delta_deg;
+
+    float limited_yaw = constrainf_local(
+        requested_yaw,
+        YAW_MIN_DEG,
+        YAW_MAX_DEG
+    );
+
+    target_angle = YawToControlAngle(limited_yaw);
+    /*
+     * Arduino clears position integral
+     * when a new command arrives.
+     */
+    pos_integral =
+        0.0f;
+    /*
+     * Do not allow the old target error
+     * to create a huge derivative kick.
+     */
+    pos_prev_error =
+        target_angle
+        - current_angle;
+    /* --------------------------------------------------------
+     * Debug
+     * -------------------------------------------------------- */
+    char msg[160];
+    snprintf(
+        msg,
+        sizeof(msg),
+        "Command %.2f deg -> "
+        "current %.2f deg -> "
+        "target %.2f deg\r\n",
+        delta_deg,
+        current_angle
+        * 180.0f
+        / PI_F,
+        target_angle
+        * 180.0f
+        / PI_F
+    );
+    UART_Print(msg);
+}
+/* ============================================================
+ * USART3 RX interrupt callback
+ * ============================================================ */
+void HAL_UART_RxCpltCallback(
+    UART_HandleTypeDef *huart
+)
+{
+    if (
+        huart->Instance
+        != USART3
+    )
+    {
+        return;
+    }
+    uint8_t c =
+        uart_rx_byte;
+    /* --------------------------------------------------------
+     * End of command
+     * -------------------------------------------------------- */
+    if (
+        c == '\n'
+        ||
+        c == '\r'
+    )
+    {
+        if (
+            uart_rx_build_index
+            > 0
+        )
+        {
+            uart_rx_build[
+                uart_rx_build_index
+            ] = '\0';
+            /*
+             * Only copy if previous command
+             * has already been consumed.
+             */
+            if (
+                !uart_command_ready
+            )
+            {
+                memcpy(
+                    uart_command,
+                    uart_rx_build,
+                    uart_rx_build_index + 1
+                );
+                uart_command_ready =
+                    1;
+            }
+            else
+            {
+                uart_busy_drop_count++;
+            }
+            uart_rx_build_index =
+                0;
+        }
+    }
+    /* --------------------------------------------------------
+     * Normal byte
+     * -------------------------------------------------------- */
+    else
+    {
+        if (
+            uart_rx_build_index
+            <
+            UART_RX_BUFFER_SIZE - 1
+        )
+        {
+            uart_rx_build[
+                uart_rx_build_index
+            ] = (char)c;
+            uart_rx_build_index++;
+        }
+        else
+        {
+            /*
+             * Overflow:
+             * discard current line.
+             */
+            uart_rx_build_index =
+                0;
+            uart_overflow_count++;
+        }
+    }
+    /*
+     * Arm next byte.
+     */
+    HAL_UART_Receive_IT(
+        &huart3,
+        &uart_rx_byte,
+        1
+    );
+}
+/* ============================================================
+ * MAIN
+ * ============================================================ */
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    DWT_Init();
+    MX_GPIO_Init();
+    MX_USART3_UART_Init();
+    MX_I2C1_Init();
+    MX_TIM4_Init();
+    /* ========================================================
+     * Start USART3 interrupt reception
+     *
+     * IMPORTANT:
+     * USART3 global interrupt must be enabled
+     * in CubeMX / .ioc
+     * ======================================================== */
+    if (
+        HAL_UART_Receive_IT(
+            &huart3,
+            &uart_rx_byte,
+            1
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    /* ========================================================
+     * PWM start
+     * ======================================================== */
+    HAL_GPIO_WritePin(
+        Driver_Enable_GPIO_Port,
+        Driver_Enable_Pin,
+        GPIO_PIN_RESET
+    );
+    HAL_TIM_PWM_Start(
+        &htim4,
+        TIM_CHANNEL_1
+    );
+    HAL_TIM_PWM_Start(
+        &htim4,
+        TIM_CHANNEL_2
+    );
+    HAL_TIM_PWM_Start(
+        &htim4,
+        TIM_CHANNEL_3
+    );
+    PWM_SetDuty(
+        0.0f,
+        0.0f,
+        0.0f
+    );
+    /* ========================================================
+     * Startup
+     * ======================================================== */
+    UART_Print(
+        "\r\n"
+        "================================\r\n"
+    );
+    UART_Print(
+        " STM32F429 BLDC FOC Controller\r\n"
+    );
+    UART_Print(
+        " USART3 INTERRUPT RX ENABLED\r\n"
+    );
+    UART_Print(
+        "================================\r\n"
+    );
+    /* ========================================================
+     * AS5600 check
+     * ======================================================== */
+    if (
+        AS5600_Check()
+        != HAL_OK
+    )
+    {
+        UART_Print(
+            "AS5600: NOT FOUND\r\n"
+        );
+        Motor_Disable();
+        Error_Handler();
+    }
+    uint8_t status = 0;
+    AS5600_ReadStatus(
+        &status
+    );
+    char b[192];
+    snprintf(
+        b,
+        sizeof(b),
+        "AS5600: OK | Status 0x%02X\r\n",
+        status
+    );
+    UART_Print(b);
+    /* ========================================================
+     * Enable motor + FOC alignment
+     * ======================================================== */
+    Sensor_UpdateAngle();
+    Motor_Enable();
+    if (
+        !FOC_AlignSensor()
+    )
+    {
+        Error_Handler();
+    }
+    /* ========================================================
+     * Current position = initial target
+     * ======================================================== */
+    Sensor_UpdateAngle();
+    target_angle =
+        ControlAngle();
+    /* Use persisted mechanical zero if configured. */
+    if (YAW_ZERO_RAW_COUNT >= 0 && YAW_ZERO_RAW_COUNT <= 4095)
+    {
+        yaw_zero_raw = (uint16_t)YAW_ZERO_RAW_COUNT;
+        yaw_zero_valid = 1;
+        Yaw_UpdateReference();
+        if (CurrentYawDeg() < YAW_MIN_DEG ||
+            CurrentYawDeg() > YAW_MAX_DEG)
+        {
+            yaw_outside_limit = 1;
+            UART_Print("YAW OUTSIDE LIMIT AT BOOT - disable tracking\r\n");
+        }
+    }
+    else
+    {
+        UART_Print("YAW UNCALIBRATED - send ZERO at physical front\r\n");
+    }
+
+    ResetControllers();
+
+
+
+    UART_Print(
+        "FOC READY (direction-corrected).\r\n"
+    );
+    UART_Print(
+        "Send relative degrees, e.g. 10 or -10\r\n"
+    );
+    /* ========================================================
+     * Main loop
+     * ======================================================== */
+    while (1)
+    {
+        if (yaw_zero_valid &&
+            (CurrentYawDeg() < YAW_MIN_DEG || CurrentYawDeg() > YAW_MAX_DEG))
+        {
+            yaw_outside_limit = 1;
+        }
+        if (yaw_outside_limit)
+        {
+            Motor_Disable(); /* hard fault latch: power-cycle after correcting position */
+        }
+        else
+        {
+            ControlLoop();
+        }
+        UART_ProcessCommands();
+        /* ----------------------------------------------------
+         * Telemetry every 200 ms
+         * ---------------------------------------------------- */
+        if (
+            HAL_GetTick()
+            - last_print_ms
+            >= 200
+        )
+        {
+            last_print_ms =
+                HAL_GetTick();
+            float control_angle =
+                ControlAngle();
+            float position_error =
+                target_angle
+                - control_angle;
+            snprintf(
+                b,
+                sizeof(b),
+                "Angle %.2f deg | "
+                "Target %.2f deg | "
+                "Error %.2f deg | "
+                "Vel %.2f rad/s | "
+                "Drops %lu/%lu\r\n",
+                control_angle
+                    * 180.0f
+                    / PI_F,
+                target_angle
+                    * 180.0f
+                    / PI_F,
+                position_error
+                    * 180.0f
+                    / PI_F,
+                shaft_velocity,
+                (unsigned long)
+                    uart_busy_drop_count,
+                (unsigned long)
+                    uart_overflow_count
+            );
+            UART_Print(b);
+            if (yaw_zero_valid)
+            {
+                float yaw = CurrentYawDeg();
+                if (yaw < YAW_MIN_DEG || yaw > YAW_MAX_DEG)
+                    yaw_outside_limit = 1;
+                snprintf(b, sizeof(b), "YAW:%.2f\r\n", yaw);
+                UART_Print(b);
+            }
+        }
+    }
+}
+/* ============================================================
+ * System Clock
+ * 168 MHz
+ * ============================================================ */
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef
+        RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef
+        RCC_ClkInitStruct = {0};
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(
+        PWR_REGULATOR_VOLTAGE_SCALE1
+    );
+    RCC_OscInitStruct.OscillatorType =
+        RCC_OSCILLATORTYPE_HSE;
+    RCC_OscInitStruct.HSEState =
+        RCC_HSE_BYPASS;
+    RCC_OscInitStruct.PLL.PLLState =
+        RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource =
+        RCC_PLLSOURCE_HSE;
+    RCC_OscInitStruct.PLL.PLLM =
+        4;
+    RCC_OscInitStruct.PLL.PLLN =
+        168;
+    RCC_OscInitStruct.PLL.PLLP =
+        RCC_PLLP_DIV2;
+    RCC_OscInitStruct.PLL.PLLQ =
+        7;
+    if (
+        HAL_RCC_OscConfig(
+            &RCC_OscInitStruct
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    RCC_ClkInitStruct.ClockType =
+        RCC_CLOCKTYPE_HCLK
+        |
+        RCC_CLOCKTYPE_SYSCLK
+        |
+        RCC_CLOCKTYPE_PCLK1
+        |
+        RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource =
+        RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider =
+        RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider =
+        RCC_HCLK_DIV4;
+    RCC_ClkInitStruct.APB2CLKDivider =
+        RCC_HCLK_DIV2;
+    if (
+        HAL_RCC_ClockConfig(
+            &RCC_ClkInitStruct,
+            FLASH_LATENCY_5
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+}
+/* ============================================================
+ * I2C1
+ * ============================================================ */
+static void MX_I2C1_Init(void)
+{
+    hi2c1.Instance =
+        I2C1;
+    hi2c1.Init.ClockSpeed =
+        100000;
+    hi2c1.Init.DutyCycle =
+        I2C_DUTYCYCLE_2;
+    hi2c1.Init.OwnAddress1 =
+        0;
+    hi2c1.Init.AddressingMode =
+        I2C_ADDRESSINGMODE_7BIT;
+    hi2c1.Init.DualAddressMode =
+        I2C_DUALADDRESS_DISABLE;
+    hi2c1.Init.OwnAddress2 =
+        0;
+    hi2c1.Init.GeneralCallMode =
+        I2C_GENERALCALL_DISABLE;
+    hi2c1.Init.NoStretchMode =
+        I2C_NOSTRETCH_DISABLE;
+    if (
+        HAL_I2C_Init(
+            &hi2c1
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    if (
+        HAL_I2CEx_ConfigAnalogFilter(
+            &hi2c1,
+            I2C_ANALOGFILTER_ENABLE
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    if (
+        HAL_I2CEx_ConfigDigitalFilter(
+            &hi2c1,
+            0
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+}
+/* ============================================================
+ * TIM4
+ *
+ * APB1 = 42 MHz
+ * TIM4 clock = 84 MHz
+ *
+ * PSC = 0
+ * ARR = 4199
+ *
+ * PWM:
+ * 84 MHz / 4200 = 20 kHz
+ * ============================================================ */
+static void MX_TIM4_Init(void)
+{
+    TIM_ClockConfigTypeDef
+        sClockSourceConfig = {0};
+    TIM_MasterConfigTypeDef
+        sMasterConfig = {0};
+    TIM_OC_InitTypeDef
+        sConfigOC = {0};
+    htim4.Instance =
+        TIM4;
+    htim4.Init.Prescaler =
+        0;
+    htim4.Init.CounterMode =
+        TIM_COUNTERMODE_UP;
+    htim4.Init.Period =
+        4199;
+    htim4.Init.ClockDivision =
+        TIM_CLOCKDIVISION_DIV1;
+    htim4.Init.AutoReloadPreload =
+        TIM_AUTORELOAD_PRELOAD_DISABLE;
+    if (
+        HAL_TIM_Base_Init(
+            &htim4
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    sClockSourceConfig.ClockSource =
+        TIM_CLOCKSOURCE_INTERNAL;
+    if (
+        HAL_TIM_ConfigClockSource(
+            &htim4,
+            &sClockSourceConfig
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    if (
+        HAL_TIM_PWM_Init(
+            &htim4
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    sMasterConfig.MasterOutputTrigger =
+        TIM_TRGO_RESET;
+    sMasterConfig.MasterSlaveMode =
+        TIM_MASTERSLAVEMODE_DISABLE;
+    if (
+        HAL_TIMEx_MasterConfigSynchronization(
+            &htim4,
+            &sMasterConfig
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    sConfigOC.OCMode =
+        TIM_OCMODE_PWM1;
+    sConfigOC.Pulse =
+        0;
+    sConfigOC.OCPolarity =
+        TIM_OCPOLARITY_HIGH;
+    sConfigOC.OCFastMode =
+        TIM_OCFAST_DISABLE;
+    if (
+        HAL_TIM_PWM_ConfigChannel(
+            &htim4,
+            &sConfigOC,
+            TIM_CHANNEL_1
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    if (
+        HAL_TIM_PWM_ConfigChannel(
+            &htim4,
+            &sConfigOC,
+            TIM_CHANNEL_2
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    if (
+        HAL_TIM_PWM_ConfigChannel(
+            &htim4,
+            &sConfigOC,
+            TIM_CHANNEL_3
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    HAL_TIM_MspPostInit(
+        &htim4
+    );
+}
+/* ============================================================
+ * USART3
+ * ============================================================ */
+static void MX_USART3_UART_Init(void)
+{
+    huart3.Instance =
+        USART3;
+    huart3.Init.BaudRate =
+        115200;
+    huart3.Init.WordLength =
+        UART_WORDLENGTH_8B;
+    huart3.Init.StopBits =
+        UART_STOPBITS_1;
+    huart3.Init.Parity =
+        UART_PARITY_NONE;
+    huart3.Init.Mode =
+        UART_MODE_TX_RX;
+    huart3.Init.HwFlowCtl =
+        UART_HWCONTROL_NONE;
+    huart3.Init.OverSampling =
+        UART_OVERSAMPLING_16;
+    if (
+        HAL_UART_Init(
+            &huart3
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+}
+/* ============================================================
+ * GPIO
+ * ============================================================ */
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef
+        GPIO_InitStruct = {0};
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOD_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    /*
+     * PD11 = Driver Enable
+     */
+    HAL_GPIO_WritePin(
+        Driver_Enable_GPIO_Port,
+        Driver_Enable_Pin,
+        GPIO_PIN_RESET
+    );
+    GPIO_InitStruct.Pin =
+        Driver_Enable_Pin;
+    GPIO_InitStruct.Mode =
+        GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull =
+        GPIO_NOPULL;
+    GPIO_InitStruct.Speed =
+        GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(
+        Driver_Enable_GPIO_Port,
+        &GPIO_InitStruct
+    );
+}
+/* ============================================================
+ * Error Handler
+ * ============================================================ */
+void Error_Handler(void)
+{
+    Motor_Disable();
+    __disable_irq();
+    while (1)
+    {
+    }
+}
+#ifdef USE_FULL_ASSERT
+void assert_failed(
+    uint8_t *file,
+    uint32_t line
+)
+{
+    (void)file;
+    (void)line;
+}
+#endif
+/*
+ * STM32F429ZI + AS5600 + SimpleFOC Mini v1.0
+ *
+ * 3PWM:
+ *   TIM4_CH1 = PD12
+ *   TIM4_CH2 = PD13
+ *   TIM4_CH3 = PD14
+ *
+ * Driver Enable:
+ *   PD11
+ *
+ * I2C1:
+ *   SCL = PB6
+ *   SDA = PB9
+ *
+ * USART3:
+ *   TX = PC12
+ *   RX = PD2
+ *   115200
+ *
+ * IMPORTANT:
+ * USART3 global interrupt must be enabled in .ioc
+ */
+#include "main.h"
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+/* ============================================================
+ * AS5600
+ * ============================================================ */
+#define AS5600_ADDR              (0x36 << 1)
+#define AS5600_STATUS_REG        0x0B
+#define AS5600_RAW_ANGLE_REG     0x0C
+/* ============================================================
+ * Motor / FOC
+ * ============================================================ */
+#define POLE_PAIRS               7.0f
+#define TWO_PI                   6.28318530718f
+#define PI_F                     3.14159265359f
+#define THREE_PI_2               4.71238898038f
+#define SUPPLY_VOLTAGE           24.9f
+#define MOTOR_VOLTAGE_LIMIT      1.5f
+#define ALIGN_VOLTAGE            1.5f
+/* ============================================================
+ * Motion limits
+ * Arduino version
+ * ============================================================ */
+#define MAX_VELOCITY             40.0f
+#define MAX_ACCELERATION         40.0f
+/* ============================================================
+ * Velocity PID
+ * Arduino:
+ *
+ * P = 0.60
+ * I = 0.27
+ * D = 0
+ * LPF = 0.16
+ * ============================================================ */
+#define VEL_KP                   0.60f
+#define VEL_KI                   0.27f
+#define VEL_KD                   0.00f
+#define VEL_LPF_TF               0.16f
+/* ============================================================
+ * Position PID
+ * Arduino:
+ *
+ * P = 4
+ * I = 0.01
+ * D = 0.262
+ * ============================================================ */
+#define POS_KP                   4.00f
+#define POS_KI                   0.01f
+#define POS_KD                   0.262f
+/* ============================================================
+ * UART
+ * ============================================================ */
+#define UART_RX_BUFFER_SIZE      64
+
+/* Mechanical yaw zero: AS5600 raw count (0..4095).
+ * -1 means uncalibrated. After ZERO, copy the reported raw count here
+ * and reflash to preserve the same physical zero after power cycling.
+ */
+#define YAW_ZERO_RAW_COUNT 3076
+#define YAW_MIN_DEG             (-100.0f)
+#define YAW_MAX_DEG             (100.0f)
+#define YAW_SIGN                (1.0f) /* change only after verifying direction */
+#define YAW_TELEMETRY_MS        (200U)
+
+/* ============================================================
+ * HAL handles
+ * ============================================================ */
+I2C_HandleTypeDef hi2c1;
+TIM_HandleTypeDef htim4;
+UART_HandleTypeDef huart3;
+/* ============================================================
+ * Motor state
+ * ============================================================ */
+static float shaft_angle = 0.0f;
+static float shaft_velocity = 0.0f;
+static float target_angle = 0.0f;
+static uint16_t yaw_zero_raw = 0;
+static uint8_t yaw_zero_valid = 0;
+static float yaw_zero_control_angle = 0.0f;
+static uint8_t yaw_outside_limit = 0;
+
+static float zero_electric_angle = 0.0f;
+static int sensor_direction = 1;
+/* ============================================================
+ * AS5600 multi-turn
+ * ============================================================ */
+static uint16_t last_raw = 0;
+static int32_t full_rotations = 0;
+static uint8_t sensor_started = 0;
+/* ============================================================
+ * Velocity PID
+ * ============================================================ */
+static float vel_integral = 0.0f;
+static float vel_prev_error = 0.0f;
+static float vel_filtered = 0.0f;
+/* ============================================================
+ * Position PID
+ * ============================================================ */
+static float pos_integral = 0.0f;
+static float pos_prev_error = 0.0f;
+/* ============================================================
+ * Acceleration limiter
+ * ============================================================ */
+static float ramped_velocity = 0.0f;
+/* ============================================================
+ * Timing
+ * ============================================================ */
+static uint32_t last_control_us = 0;
+static uint32_t last_print_ms = 0;
+/* ============================================================
+ * UART Interrupt RX
+ * ============================================================ */
+static uint8_t uart_rx_byte;
+static char uart_rx_build[UART_RX_BUFFER_SIZE];
+static volatile uint8_t uart_rx_build_index = 0;
+static char uart_command[UART_RX_BUFFER_SIZE];
+static volatile uint8_t uart_command_ready = 0;
+static volatile uint32_t uart_overflow_count = 0;
+static volatile uint32_t uart_busy_drop_count = 0;
+/* ============================================================
+ * Function prototypes
+ * ============================================================ */
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_USART3_UART_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_TIM4_Init(void);
+void Error_Handler(void);
+/* ============================================================
+ * Utility
+ * ============================================================ */
+static float constrainf_local(
+    float x,
+    float lo,
+    float hi
+)
+{
+    if (x < lo)
+        return lo;
+    if (x > hi)
+        return hi;
+    return x;
+}
+static float normalize_angle(float a)
+{
+    a = fmodf(a, TWO_PI);
+    if (a < 0.0f)
+        a += TWO_PI;
+    return a;
+}
+/* ============================================================
+ * DWT timer
+ * ============================================================ */
+static void DWT_Init(void)
+{
+    CoreDebug->DEMCR |=
+        CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |=
+        DWT_CTRL_CYCCNTENA_Msk;
+}
+static uint32_t micros32(void)
+{
+    return
+        DWT->CYCCNT /
+        (HAL_RCC_GetHCLKFreq() / 1000000U);
+}
+/* ============================================================
+ * UART TX
+ * ============================================================ */
+static void UART_Print(const char *s)
+{
+    HAL_UART_Transmit(
+        &huart3,
+        (uint8_t *)s,
+        strlen(s),
+        100
+    );
+}
+/* ============================================================
+ * AS5600
+ * ============================================================ */
+static HAL_StatusTypeDef AS5600_Check(void)
+{
+    return HAL_I2C_IsDeviceReady(
+        &hi2c1,
+        AS5600_ADDR,
+        3,
+        100
+    );
+}
+static HAL_StatusTypeDef AS5600_ReadStatus(
+    uint8_t *status
+)
+{
+    return HAL_I2C_Mem_Read(
+        &hi2c1,
+        AS5600_ADDR,
+        AS5600_STATUS_REG,
+        I2C_MEMADD_SIZE_8BIT,
+        status,
+        1,
+        100
+    );
+}
+static uint16_t AS5600_ReadRawAngle(void)
+{
+    uint8_t data[2];
+    if (
+        HAL_I2C_Mem_Read(
+            &hi2c1,
+            AS5600_ADDR,
+            AS5600_RAW_ANGLE_REG,
+            I2C_MEMADD_SIZE_8BIT,
+            data,
+            2,
+            100
+        )
+        != HAL_OK
+    )
+    {
+        return 0xFFFF;
+    }
+    return
+        (
+            (
+                ((uint16_t)data[0] << 8)
+                | data[1]
+            )
+            & 0x0FFF
+        );
+}
+/* ============================================================
+ * AS5600 multi-turn angle
+ * ============================================================ */
+static float Sensor_UpdateAngle(void)
+{
+    uint16_t raw =
+        AS5600_ReadRawAngle();
+    if (raw == 0xFFFF)
+    {
+        return shaft_angle;
+    }
+    if (!sensor_started)
+    {
+        last_raw = raw;
+        full_rotations = 0;
+        sensor_started = 1;
+    }
+    else
+    {
+        int32_t d =
+            (int32_t)raw
+            - (int32_t)last_raw;
+        if (d > 2048)
+        {
+            full_rotations--;
+        }
+        else if (d < -2048)
+        {
+            full_rotations++;
+        }
+        last_raw = raw;
+    }
+    float turns =
+        (float)full_rotations
+        +
+        ((float)raw / 4096.0f);
+    shaft_angle =
+        turns * TWO_PI;
+    return shaft_angle;
+}
+/* ============================================================
+ * PWM
+ * ============================================================ */
+static void PWM_SetDuty(
+    float da,
+    float db,
+    float dc
+)
+{
+    da = constrainf_local(
+        da,
+        0.0f,
+        1.0f
+    );
+    db = constrainf_local(
+        db,
+        0.0f,
+        1.0f
+    );
+    dc = constrainf_local(
+        dc,
+        0.0f,
+        1.0f
+    );
+    uint32_t arr =
+        __HAL_TIM_GET_AUTORELOAD(
+            &htim4
+        ) + 1U;
+    __HAL_TIM_SET_COMPARE(
+        &htim4,
+        TIM_CHANNEL_1,
+        (uint32_t)(da * arr)
+    );
+    __HAL_TIM_SET_COMPARE(
+        &htim4,
+        TIM_CHANNEL_2,
+        (uint32_t)(db * arr)
+    );
+    __HAL_TIM_SET_COMPARE(
+        &htim4,
+        TIM_CHANNEL_3,
+        (uint32_t)(dc * arr)
+    );
+}
+/* ============================================================
+ * Driver enable
+ * ============================================================ */
+static void Motor_Disable(void)
+{
+    PWM_SetDuty(
+        0.0f,
+        0.0f,
+        0.0f
+    );
+    HAL_GPIO_WritePin(
+        Driver_Enable_GPIO_Port,
+        Driver_Enable_Pin,
+        GPIO_PIN_RESET
+    );
+}
+static void Motor_Enable(void)
+{
+    HAL_GPIO_WritePin(
+        Driver_Enable_GPIO_Port,
+        Driver_Enable_Pin,
+        GPIO_PIN_SET
+    );
+}
+/* ============================================================
+ * FOC voltage
+ * ============================================================ */
+static void SetPhaseVoltage(
+    float Uq,
+    float electrical_angle
+)
+{
+    Uq = constrainf_local(
+        Uq,
+        -MOTOR_VOLTAGE_LIMIT,
+        MOTOR_VOLTAGE_LIMIT
+    );
+    electrical_angle =
+        normalize_angle(
+            electrical_angle
+        );
+    float Ualpha =
+        -Uq * sinf(
+            electrical_angle
+        );
+    float Ubeta =
+        Uq * cosf(
+            electrical_angle
+        );
+    float Ua =
+        Ualpha
+        +
+        SUPPLY_VOLTAGE * 0.5f;
+    float Ub =
+        (
+            -0.5f * Ualpha
+            +
+            0.86602540378f * Ubeta
+        )
+        +
+        SUPPLY_VOLTAGE * 0.5f;
+    float Uc =
+        (
+            -0.5f * Ualpha
+            -
+            0.86602540378f * Ubeta
+        )
+        +
+        SUPPLY_VOLTAGE * 0.5f;
+    PWM_SetDuty(
+        Ua / SUPPLY_VOLTAGE,
+        Ub / SUPPLY_VOLTAGE,
+        Uc / SUPPLY_VOLTAGE
+    );
+}
+/* ============================================================
+ * Direction-corrected mechanical angle
+ * ============================================================ */
+static float ControlAngle(void)
+{
+    return
+        (float)sensor_direction
+        * shaft_angle;
+}
+/* Fixed mechanical yaw zero: wrap raw difference to +/-180 deg.
+ * Valid for direct-drive AS5600 and a mechanical range smaller than 180 deg
+ * on each side of zero; no gearbox or multi-turn absolute recovery.
+ */
+static float YawFromRawDeg(uint16_t raw)
+{
+    int32_t d = (int32_t)raw - (int32_t)yaw_zero_raw;
+    if (d > 2047) d -= 4096;
+    if (d < -2048) d += 4096;
+    return YAW_SIGN * (float)d * (360.0f / 4096.0f);
+}
+
+static float CurrentYawDeg(void)
+{
+    return YawFromRawDeg(last_raw);
+}
+
+/* Map mechanical yaw coordinate into existing continuous PID coordinate.
+ * ControlAngle() includes the FOC-detected sensor direction.
+ */
+static void Yaw_UpdateReference(void)
+{
+    float yaw_rad = CurrentYawDeg() * (PI_F / 180.0f);
+    yaw_zero_control_angle = ControlAngle() -
+        ((float)sensor_direction / YAW_SIGN) * yaw_rad;
+}
+
+static float YawToControlAngle(float yaw_deg)
+{
+    return yaw_zero_control_angle +
+        ((float)sensor_direction / YAW_SIGN) *
+        yaw_deg * (PI_F / 180.0f);
+}
+
+/* ============================================================
+ * Electrical angle
+ * ============================================================ */
+static float ElectricalAngle(void)
+{
+    return normalize_angle(
+        POLE_PAIRS
+        * ControlAngle()
+        - zero_electric_angle
+    );
+}
+/* ============================================================
+ * FOC sensor alignment
+ *
+ * 自動判斷 sensor direction
+ * +
+ * electrical zero
+ * ============================================================ */
+static uint8_t FOC_AlignSensor(void)
+{
+    char b[128];
+    UART_Print(
+        "FOC alignment...\r\n"
+    );
+    Sensor_UpdateAngle();
+    float start =
+        shaft_angle;
+    /* --------------------------------------------------------
+     * Forward electrical sweep
+     * -------------------------------------------------------- */
+    for (int i = 0; i <= 500; i++)
+    {
+        float a =
+            THREE_PI_2
+            +
+            TWO_PI
+            * ((float)i / 500.0f);
+        SetPhaseVoltage(
+            ALIGN_VOLTAGE,
+            a
+        );
+        HAL_Delay(2);
+        Sensor_UpdateAngle();
+    }
+    float mid =
+        shaft_angle;
+    /* --------------------------------------------------------
+     * Sweep back
+     * -------------------------------------------------------- */
+    for (int i = 500; i >= 0; i--)
+    {
+        float a =
+            THREE_PI_2
+            +
+            TWO_PI
+            * ((float)i / 500.0f);
+        SetPhaseVoltage(
+            ALIGN_VOLTAGE,
+            a
+        );
+        HAL_Delay(2);
+        Sensor_UpdateAngle();
+    }
+    float moved =
+        mid - start;
+    if (fabsf(moved) < 0.01f)
+    {
+        UART_Print(
+            "ALIGN ERROR: sensor did not move\r\n"
+        );
+        Motor_Disable();
+        return 0;
+    }
+    sensor_direction =
+        (moved > 0.0f)
+        ? 1
+        : -1;
+    /* --------------------------------------------------------
+     * Lock rotor and determine electrical zero
+     * -------------------------------------------------------- */
+    SetPhaseVoltage(
+        ALIGN_VOLTAGE,
+        THREE_PI_2
+    );
+    HAL_Delay(700);
+    Sensor_UpdateAngle();
+    zero_electric_angle =
+        normalize_angle(
+            POLE_PAIRS
+            * ControlAngle()
+        );
+    SetPhaseVoltage(
+        0.0f,
+        0.0f
+    );
+    HAL_Delay(200);
+    snprintf(
+        b,
+        sizeof(b),
+        "Direction: %s | "
+        "Zero electrical: %.4f rad\r\n",
+        sensor_direction > 0
+            ? "CW/+"
+            : "CCW/-",
+        zero_electric_angle
+    );
+    UART_Print(b);
+    return 1;
+}
+/* ============================================================
+ * Reset controllers
+ * ============================================================ */
+static void ResetControllers(void)
+{
+    vel_integral = 0.0f;
+    vel_prev_error = 0.0f;
+    vel_filtered = 0.0f;
+    pos_integral = 0.0f;
+    pos_prev_error = 0.0f;
+    ramped_velocity = 0.0f;
+    last_control_us =
+        micros32();
+}
+/* ============================================================
+ * Cascade controller
+ *
+ * Position PID
+ *      ↓
+ * requested velocity
+ *      ↓
+ * acceleration limit
+ *      ↓
+ * ramped velocity
+ *      ↓
+ * Velocity PID
+ *      ↓
+ * Uq
+ *      ↓
+ * FOC
+ * ============================================================ */
+static void ControlLoop(void)
+{
+    uint32_t now =
+        micros32();
+    float dt =
+        (float)(
+            now - last_control_us
+        )
+        * 1e-6f;
+    if (
+        dt <= 0.0f
+        ||
+        dt > 0.05f
+    )
+    {
+        dt = 0.001f;
+    }
+    last_control_us =
+        now;
+    /* --------------------------------------------------------
+     * Sensor + velocity
+     * -------------------------------------------------------- */
+    float old_control_angle =
+        ControlAngle();
+    Sensor_UpdateAngle();
+    float control_angle =
+        ControlAngle();
+    float raw_velocity =
+        (
+            control_angle
+            - old_control_angle
+        )
+        / dt;
+    /* --------------------------------------------------------
+     * Velocity LPF
+     *
+     * Arduino SimpleFOC:
+     * LPF_velocity.Tf = 0.16
+     * -------------------------------------------------------- */
+    float alpha =
+        VEL_LPF_TF
+        /
+        (
+            VEL_LPF_TF
+            + dt
+        );
+    vel_filtered =
+        alpha
+        * vel_filtered
+        +
+        (1.0f - alpha)
+        * raw_velocity;
+    shaft_velocity =
+        vel_filtered;
+    /* ========================================================
+     * Position PID
+     * ======================================================== */
+    float pe =
+        target_angle
+        - control_angle;
+    pos_integral +=
+        pe * dt;
+    /*
+     * Arduino integral limit = 2.0
+     */
+    pos_integral =
+        constrainf_local(
+            pos_integral,
+            -2.0f,
+            2.0f
+        );
+    float pd =
+        (
+            pe
+            - pos_prev_error
+        )
+        / dt;
+    pos_prev_error =
+        pe;
+    float requested_velocity =
+        POS_KP * pe
+        +
+        POS_KI * pos_integral
+        +
+        POS_KD * pd;
+    requested_velocity =
+        constrainf_local(
+            requested_velocity,
+            -MAX_VELOCITY,
+            MAX_VELOCITY
+        );
+    /* ========================================================
+     * Acceleration limiter
+     * ======================================================== */
+    float dv_max =
+        MAX_ACCELERATION
+        * dt;
+    float dv =
+        requested_velocity
+        - ramped_velocity;
+    dv =
+        constrainf_local(
+            dv,
+            -dv_max,
+            dv_max
+        );
+    ramped_velocity +=
+        dv;
+    /* ========================================================
+     * Velocity PID
+     * ======================================================== */
+    float ve =
+        ramped_velocity
+        - shaft_velocity;
+    /*
+     * SimpleFOC style:
+     * integral already contains KI.
+     */
+    vel_integral +=
+        VEL_KI
+        * ve
+        * dt;
+    vel_integral =
+        constrainf_local(
+            vel_integral,
+            -MOTOR_VOLTAGE_LIMIT,
+            MOTOR_VOLTAGE_LIMIT
+        );
+    float vd =
+        (
+            ve
+            - vel_prev_error
+        )
+        / dt;
+    vel_prev_error =
+        ve;
+    float Uq =
+        VEL_KP * ve
+        +
+        vel_integral
+        +
+        VEL_KD * vd;
+    Uq =
+        constrainf_local(
+            Uq,
+            -MOTOR_VOLTAGE_LIMIT,
+            MOTOR_VOLTAGE_LIMIT
+        );
+    /* ========================================================
+     * FOC output
+     * ======================================================== */
+    SetPhaseVoltage(
+        Uq,
+        ElectricalAngle()
+    );
+}
+/* ============================================================
+ * UART command parser
+ *
+ * Ubuntu sends:
+ *
+ * 10.0\n
+ * -20.0\n
+ *
+ * Arduino behavior:
+ *
+ * target =
+ * CURRENT POSITION + relative command
+ * ============================================================ */
+static void UART_ProcessCommands(void)
+{
+    if (!uart_command_ready)
+    {
+        return;
+    }
+    char local_command[
+        UART_RX_BUFFER_SIZE
+    ];
+    /*
+     * Critical section:
+     * copy completed command.
+     *
+     * We only disable USART3 RXNE briefly.
+     */
+    __HAL_UART_DISABLE_IT(
+        &huart3,
+        UART_IT_RXNE
+    );
+    strncpy(
+        local_command,
+        uart_command,
+        UART_RX_BUFFER_SIZE
+    );
+    local_command[
+        UART_RX_BUFFER_SIZE - 1
+    ] = '\0';
+    uart_command_ready = 0;
+    __HAL_UART_ENABLE_IT(
+        &huart3,
+        UART_IT_RXNE
+    );
+    /* ZERO: set the physical front direction to zero in RAM.
+     * Reflash YAW_ZERO_RAW_COUNT to make it persistent.
+     * Stop ROS tracking before using this command.
+     */
+    if (strcmp(local_command, "ZERO") == 0)
+    {
+        Sensor_UpdateAngle();
+        yaw_zero_raw = last_raw;
+        yaw_zero_valid = 1;
+        Yaw_UpdateReference();
+        target_angle = ControlAngle();
+        pos_integral = 0.0f;
+        pos_prev_error = 0.0f;
+        char zmsg[96];
+        snprintf(zmsg, sizeof(zmsg),
+                 "YAW ZERO raw=%u (set YAW_ZERO_RAW_COUNT=%u to persist)\r\n",
+                 (unsigned)yaw_zero_raw, (unsigned)yaw_zero_raw);
+        UART_Print(zmsg);
+        return;
+    }
+    if (strcmp(local_command, "YAW?") == 0)
+    {
+        char ymsg[96];
+        if (yaw_zero_valid)
+            snprintf(ymsg, sizeof(ymsg), "YAW:%.2f\r\n", CurrentYawDeg());
+        else
+            snprintf(ymsg, sizeof(ymsg), "YAW UNCALIBRATED\r\n");
+        UART_Print(ymsg);
+        return;
+    }
+    if (!yaw_zero_valid)
+    {
+        UART_Print("YAW UNCALIBRATED: use ZERO at mechanical front\r\n");
+        return;
+    }
+    if (yaw_outside_limit)
+    {
+        UART_Print("YAW OUTSIDE LIMIT: commands disabled\r\n");
+        return;
+    }
+
+    /* --------------------------------------------------------
+     * Parse float
+     * -------------------------------------------------------- */
+    char *endptr = NULL;
+    float delta_deg =
+        strtof(
+            local_command,
+            &endptr
+        );
+    if (
+        endptr
+        ==
+        local_command
+    )
+    {
+        char msg[128];
+        snprintf(
+            msg,
+            sizeof(msg),
+            "UART INVALID: %s\r\n",
+            local_command
+        );
+        UART_Print(msg);
+        return;
+    }
+    /*
+     * Allow trailing spaces/tabs only.
+     */
+    while (
+        *endptr == ' '
+        ||
+        *endptr == '\t'
+    )
+    {
+        endptr++;
+    }
+    if (*endptr != '\0')
+    {
+        char msg[128];
+        snprintf(
+            msg,
+            sizeof(msg),
+            "UART INVALID FORMAT: %s\r\n",
+            local_command
+        );
+        UART_Print(msg);
+        return;
+    }
+    /* --------------------------------------------------------
+     * Safety
+     *
+     * Person tracker should never command
+     * thousands of degrees.
+     * -------------------------------------------------------- */
+    if (
+        !isfinite(delta_deg)
+        ||
+        delta_deg < -180.0f
+        ||
+        delta_deg > 180.0f
+    )
+    {
+        char msg[128];
+        snprintf(
+            msg,
+            sizeof(msg),
+            "UART REJECT: %.2f deg\r\n",
+            delta_deg
+        );
+        UART_Print(msg);
+        return;
+    }
+    /* ========================================================
+     * IMPORTANT
+     *
+     * Same behavior as Arduino:
+     *
+     * target =
+     * CURRENT POSITION + command
+     *
+     * NOT:
+     *
+     * target += command
+     * ======================================================== */
+    Sensor_UpdateAngle();
+    float current_angle =
+        ControlAngle();
+    /* Original relative-command behavior, now with a fixed yaw clamp. */
+    float current_yaw = CurrentYawDeg();
+
+    float requested_yaw =
+        current_yaw +
+        ((float)sensor_direction / YAW_SIGN) * delta_deg;
+
+    float limited_yaw = constrainf_local(
+        requested_yaw,
+        YAW_MIN_DEG,
+        YAW_MAX_DEG
+    );
+
+    target_angle = YawToControlAngle(limited_yaw);
+    /*
+     * Arduino clears position integral
+     * when a new command arrives.
+     */
+    pos_integral =
+        0.0f;
+    /*
+     * Do not allow the old target error
+     * to create a huge derivative kick.
+     */
+    pos_prev_error =
+        target_angle
+        - current_angle;
+    /* --------------------------------------------------------
+     * Debug
+     * -------------------------------------------------------- */
+    char msg[160];
+    snprintf(
+        msg,
+        sizeof(msg),
+        "Command %.2f deg -> "
+        "current %.2f deg -> "
+        "target %.2f deg\r\n",
+        delta_deg,
+        current_angle
+        * 180.0f
+        / PI_F,
+        target_angle
+        * 180.0f
+        / PI_F
+    );
+    UART_Print(msg);
+}
+/* ============================================================
+ * USART3 RX interrupt callback
+ * ============================================================ */
+void HAL_UART_RxCpltCallback(
+    UART_HandleTypeDef *huart
+)
+{
+    if (
+        huart->Instance
+        != USART3
+    )
+    {
+        return;
+    }
+    uint8_t c =
+        uart_rx_byte;
+    /* --------------------------------------------------------
+     * End of command
+     * -------------------------------------------------------- */
+    if (
+        c == '\n'
+        ||
+        c == '\r'
+    )
+    {
+        if (
+            uart_rx_build_index
+            > 0
+        )
+        {
+            uart_rx_build[
+                uart_rx_build_index
+            ] = '\0';
+            /*
+             * Only copy if previous command
+             * has already been consumed.
+             */
+            if (
+                !uart_command_ready
+            )
+            {
+                memcpy(
+                    uart_command,
+                    uart_rx_build,
+                    uart_rx_build_index + 1
+                );
+                uart_command_ready =
+                    1;
+            }
+            else
+            {
+                uart_busy_drop_count++;
+            }
+            uart_rx_build_index =
+                0;
+        }
+    }
+    /* --------------------------------------------------------
+     * Normal byte
+     * -------------------------------------------------------- */
+    else
+    {
+        if (
+            uart_rx_build_index
+            <
+            UART_RX_BUFFER_SIZE - 1
+        )
+        {
+            uart_rx_build[
+                uart_rx_build_index
+            ] = (char)c;
+            uart_rx_build_index++;
+        }
+        else
+        {
+            /*
+             * Overflow:
+             * discard current line.
+             */
+            uart_rx_build_index =
+                0;
+            uart_overflow_count++;
+        }
+    }
+    /*
+     * Arm next byte.
+     */
+    HAL_UART_Receive_IT(
+        &huart3,
+        &uart_rx_byte,
+        1
+    );
+}
+/* ============================================================
+ * MAIN
+ * ============================================================ */
+int main(void)
+{
+    HAL_Init();
+    SystemClock_Config();
+    DWT_Init();
+    MX_GPIO_Init();
+    MX_USART3_UART_Init();
+    MX_I2C1_Init();
+    MX_TIM4_Init();
+    /* ========================================================
+     * Start USART3 interrupt reception
+     *
+     * IMPORTANT:
+     * USART3 global interrupt must be enabled
+     * in CubeMX / .ioc
+     * ======================================================== */
+    if (
+        HAL_UART_Receive_IT(
+            &huart3,
+            &uart_rx_byte,
+            1
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    /* ========================================================
+     * PWM start
+     * ======================================================== */
+    HAL_GPIO_WritePin(
+        Driver_Enable_GPIO_Port,
+        Driver_Enable_Pin,
+        GPIO_PIN_RESET
+    );
+    HAL_TIM_PWM_Start(
+        &htim4,
+        TIM_CHANNEL_1
+    );
+    HAL_TIM_PWM_Start(
+        &htim4,
+        TIM_CHANNEL_2
+    );
+    HAL_TIM_PWM_Start(
+        &htim4,
+        TIM_CHANNEL_3
+    );
+    PWM_SetDuty(
+        0.0f,
+        0.0f,
+        0.0f
+    );
+    /* ========================================================
+     * Startup
+     * ======================================================== */
+    UART_Print(
+        "\r\n"
+        "================================\r\n"
+    );
+    UART_Print(
+        " STM32F429 BLDC FOC Controller\r\n"
+    );
+    UART_Print(
+        " USART3 INTERRUPT RX ENABLED\r\n"
+    );
+    UART_Print(
+        "================================\r\n"
+    );
+    /* ========================================================
+     * AS5600 check
+     * ======================================================== */
+    if (
+        AS5600_Check()
+        != HAL_OK
+    )
+    {
+        UART_Print(
+            "AS5600: NOT FOUND\r\n"
+        );
+        Motor_Disable();
+        Error_Handler();
+    }
+    uint8_t status = 0;
+    AS5600_ReadStatus(
+        &status
+    );
+    char b[192];
+    snprintf(
+        b,
+        sizeof(b),
+        "AS5600: OK | Status 0x%02X\r\n",
+        status
+    );
+    UART_Print(b);
+    /* ========================================================
+     * Enable motor + FOC alignment
+     * ======================================================== */
+    Sensor_UpdateAngle();
+    Motor_Enable();
+    if (
+        !FOC_AlignSensor()
+    )
+    {
+        Error_Handler();
+    }
+    /* ========================================================
+     * Current position = initial target
+     * ======================================================== */
+    Sensor_UpdateAngle();
+    target_angle =
+        ControlAngle();
+    /* Use persisted mechanical zero if configured. */
+    if (YAW_ZERO_RAW_COUNT >= 0 && YAW_ZERO_RAW_COUNT <= 4095)
+    {
+        yaw_zero_raw = (uint16_t)YAW_ZERO_RAW_COUNT;
+        yaw_zero_valid = 1;
+        Yaw_UpdateReference();
+        if (CurrentYawDeg() < YAW_MIN_DEG ||
+            CurrentYawDeg() > YAW_MAX_DEG)
+        {
+            yaw_outside_limit = 1;
+            UART_Print("YAW OUTSIDE LIMIT AT BOOT - disable tracking\r\n");
+        }
+    }
+    else
+    {
+        UART_Print("YAW UNCALIBRATED - send ZERO at physical front\r\n");
+    }
+
+    ResetControllers();
+
+
+
+    UART_Print(
+        "FOC READY (direction-corrected).\r\n"
+    );
+    UART_Print(
+        "Send relative degrees, e.g. 10 or -10\r\n"
+    );
+    /* ========================================================
+     * Main loop
+     * ======================================================== */
+    while (1)
+    {
+        if (yaw_zero_valid &&
+            (CurrentYawDeg() < YAW_MIN_DEG || CurrentYawDeg() > YAW_MAX_DEG))
+        {
+            yaw_outside_limit = 1;
+        }
+        if (yaw_outside_limit)
+        {
+            Motor_Disable(); /* hard fault latch: power-cycle after correcting position */
+        }
+        else
+        {
+            ControlLoop();
+        }
+        UART_ProcessCommands();
+        /* ----------------------------------------------------
+         * Telemetry every 200 ms
+         * ---------------------------------------------------- */
+        if (
+            HAL_GetTick()
+            - last_print_ms
+            >= 200
+        )
+        {
+            last_print_ms =
+                HAL_GetTick();
+            float control_angle =
+                ControlAngle();
+            float position_error =
+                target_angle
+                - control_angle;
+            snprintf(
+                b,
+                sizeof(b),
+                "Angle %.2f deg | "
+                "Target %.2f deg | "
+                "Error %.2f deg | "
+                "Vel %.2f rad/s | "
+                "Drops %lu/%lu\r\n",
+                control_angle
+                    * 180.0f
+                    / PI_F,
+                target_angle
+                    * 180.0f
+                    / PI_F,
+                position_error
+                    * 180.0f
+                    / PI_F,
+                shaft_velocity,
+                (unsigned long)
+                    uart_busy_drop_count,
+                (unsigned long)
+                    uart_overflow_count
+            );
+            UART_Print(b);
+            if (yaw_zero_valid)
+            {
+                float yaw = CurrentYawDeg();
+                if (yaw < YAW_MIN_DEG || yaw > YAW_MAX_DEG)
+                    yaw_outside_limit = 1;
+                snprintf(b, sizeof(b), "YAW:%.2f\r\n", yaw);
+                UART_Print(b);
+            }
+        }
+    }
+}
+/* ============================================================
+ * System Clock
+ * 168 MHz
+ * ============================================================ */
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef
+        RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef
+        RCC_ClkInitStruct = {0};
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(
+        PWR_REGULATOR_VOLTAGE_SCALE1
+    );
+    RCC_OscInitStruct.OscillatorType =
+        RCC_OSCILLATORTYPE_HSE;
+    RCC_OscInitStruct.HSEState =
+        RCC_HSE_BYPASS;
+    RCC_OscInitStruct.PLL.PLLState =
+        RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource =
+        RCC_PLLSOURCE_HSE;
+    RCC_OscInitStruct.PLL.PLLM =
+        4;
+    RCC_OscInitStruct.PLL.PLLN =
+        168;
+    RCC_OscInitStruct.PLL.PLLP =
+        RCC_PLLP_DIV2;
+    RCC_OscInitStruct.PLL.PLLQ =
+        7;
+    if (
+        HAL_RCC_OscConfig(
+            &RCC_OscInitStruct
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    RCC_ClkInitStruct.ClockType =
+        RCC_CLOCKTYPE_HCLK
+        |
+        RCC_CLOCKTYPE_SYSCLK
+        |
+        RCC_CLOCKTYPE_PCLK1
+        |
+        RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource =
+        RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider =
+        RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider =
+        RCC_HCLK_DIV4;
+    RCC_ClkInitStruct.APB2CLKDivider =
+        RCC_HCLK_DIV2;
+    if (
+        HAL_RCC_ClockConfig(
+            &RCC_ClkInitStruct,
+            FLASH_LATENCY_5
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+}
+/* ============================================================
+ * I2C1
+ * ============================================================ */
+static void MX_I2C1_Init(void)
+{
+    hi2c1.Instance =
+        I2C1;
+    hi2c1.Init.ClockSpeed =
+        100000;
+    hi2c1.Init.DutyCycle =
+        I2C_DUTYCYCLE_2;
+    hi2c1.Init.OwnAddress1 =
+        0;
+    hi2c1.Init.AddressingMode =
+        I2C_ADDRESSINGMODE_7BIT;
+    hi2c1.Init.DualAddressMode =
+        I2C_DUALADDRESS_DISABLE;
+    hi2c1.Init.OwnAddress2 =
+        0;
+    hi2c1.Init.GeneralCallMode =
+        I2C_GENERALCALL_DISABLE;
+    hi2c1.Init.NoStretchMode =
+        I2C_NOSTRETCH_DISABLE;
+    if (
+        HAL_I2C_Init(
+            &hi2c1
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    if (
+        HAL_I2CEx_ConfigAnalogFilter(
+            &hi2c1,
+            I2C_ANALOGFILTER_ENABLE
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    if (
+        HAL_I2CEx_ConfigDigitalFilter(
+            &hi2c1,
+            0
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+}
+/* ============================================================
+ * TIM4
+ *
+ * APB1 = 42 MHz
+ * TIM4 clock = 84 MHz
+ *
+ * PSC = 0
+ * ARR = 4199
+ *
+ * PWM:
+ * 84 MHz / 4200 = 20 kHz
+ * ============================================================ */
+static void MX_TIM4_Init(void)
+{
+    TIM_ClockConfigTypeDef
+        sClockSourceConfig = {0};
+    TIM_MasterConfigTypeDef
+        sMasterConfig = {0};
+    TIM_OC_InitTypeDef
+        sConfigOC = {0};
+    htim4.Instance =
+        TIM4;
+    htim4.Init.Prescaler =
+        0;
+    htim4.Init.CounterMode =
+        TIM_COUNTERMODE_UP;
+    htim4.Init.Period =
+        4199;
+    htim4.Init.ClockDivision =
+        TIM_CLOCKDIVISION_DIV1;
+    htim4.Init.AutoReloadPreload =
+        TIM_AUTORELOAD_PRELOAD_DISABLE;
+    if (
+        HAL_TIM_Base_Init(
+            &htim4
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    sClockSourceConfig.ClockSource =
+        TIM_CLOCKSOURCE_INTERNAL;
+    if (
+        HAL_TIM_ConfigClockSource(
+            &htim4,
+            &sClockSourceConfig
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    if (
+        HAL_TIM_PWM_Init(
+            &htim4
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    sMasterConfig.MasterOutputTrigger =
+        TIM_TRGO_RESET;
+    sMasterConfig.MasterSlaveMode =
+        TIM_MASTERSLAVEMODE_DISABLE;
+    if (
+        HAL_TIMEx_MasterConfigSynchronization(
+            &htim4,
+            &sMasterConfig
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    sConfigOC.OCMode =
+        TIM_OCMODE_PWM1;
+    sConfigOC.Pulse =
+        0;
+    sConfigOC.OCPolarity =
+        TIM_OCPOLARITY_HIGH;
+    sConfigOC.OCFastMode =
+        TIM_OCFAST_DISABLE;
+    if (
+        HAL_TIM_PWM_ConfigChannel(
+            &htim4,
+            &sConfigOC,
+            TIM_CHANNEL_1
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    if (
+        HAL_TIM_PWM_ConfigChannel(
+            &htim4,
+            &sConfigOC,
+            TIM_CHANNEL_2
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    if (
+        HAL_TIM_PWM_ConfigChannel(
+            &htim4,
+            &sConfigOC,
+            TIM_CHANNEL_3
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+    HAL_TIM_MspPostInit(
+        &htim4
+    );
+}
+/* ============================================================
+ * USART3
+ * ============================================================ */
+static void MX_USART3_UART_Init(void)
+{
+    huart3.Instance =
+        USART3;
+    huart3.Init.BaudRate =
+        115200;
+    huart3.Init.WordLength =
+        UART_WORDLENGTH_8B;
+    huart3.Init.StopBits =
+        UART_STOPBITS_1;
+    huart3.Init.Parity =
+        UART_PARITY_NONE;
+    huart3.Init.Mode =
+        UART_MODE_TX_RX;
+    huart3.Init.HwFlowCtl =
+        UART_HWCONTROL_NONE;
+    huart3.Init.OverSampling =
+        UART_OVERSAMPLING_16;
+    if (
+        HAL_UART_Init(
+            &huart3
+        )
+        != HAL_OK
+    )
+    {
+        Error_Handler();
+    }
+}
+/* ============================================================
+ * GPIO
+ * ============================================================ */
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef
+        GPIO_InitStruct = {0};
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOD_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    /*
+     * PD11 = Driver Enable
+     */
+    HAL_GPIO_WritePin(
+        Driver_Enable_GPIO_Port,
+        Driver_Enable_Pin,
+        GPIO_PIN_RESET
+    );
+    GPIO_InitStruct.Pin =
+        Driver_Enable_Pin;
+    GPIO_InitStruct.Mode =
+        GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull =
+        GPIO_NOPULL;
+    GPIO_InitStruct.Speed =
+        GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(
+        Driver_Enable_GPIO_Port,
+        &GPIO_InitStruct
+    );
+}
+/* ============================================================
+ * Error Handler
+ * ============================================================ */
+void Error_Handler(void)
+{
+    Motor_Disable();
+    __disable_irq();
+    while (1)
+    {
+    }
+}
+#ifdef USE_FULL_ASSERT
+void assert_failed(
+    uint8_t *file,
+    uint32_t line
+)
+{
+    (void)file;
+    (void)line;
+}
+#endif
