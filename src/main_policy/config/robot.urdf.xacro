@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro"
+       name="my_robot">
+
+  <!-- Base -->
+  <link name="base_link"/>
+
+  <!-- Camera -->
+  <link name="camera_link"/>
+
+  <!-- base_link -> camera_link -->
+  <joint name="base_to_camera" type="fixed">
+    <parent link="base_link"/>
+    <child link="camera_link"/>
+
+    <!-- x y z -->
+    <origin xyz="0.20 0.0 0.35"
+            rpy="0.0 0.0 0.0"/>
+  </joint>
+
+</robot>
