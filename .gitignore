@@ -87,3 +87,4 @@ tensorboard/
 # ==========================================
 .DS_Store
 Thumbs.db
+src/sensor/camera/model.zip
